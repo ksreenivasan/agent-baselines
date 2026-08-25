@@ -21,10 +21,13 @@ The check covered the HLE-specific tests plus the repository's basic mock-LLM an
 
 Static isolation checks verify `network_mode: none`, read-only root, dropped capabilities, non-root user, no broad host volume, and no Docker socket.
 
-## Concrete blockers before a live HLE smoke
+After the shared base image became available locally, the sandbox was built with pulls disabled and exercised under the explicit Compose project `hle-tools-v0-offline`. Runtime inspection confirmed no network, privileges, capabilities, bind mounts, Docker socket, or secret environment. Container Python executed successfully, an outbound socket was blocked, and scoped cleanup left no project containers.
+
+A full offline Inspect fixture then exercised all three approved tools in sequence—fixture search, controlled fetch, and stateful Python—followed by structured submission and scoring. The synthetic answer scored 1/1. Inspect removed its sample container; no HLE container remained. The locally built sandbox image was `sha256:e3c88d43cc9de4bfb2f73255f49c87165028b7e0882230ca62c753f2fc6c2d41`.
+
+## Concrete blockers before a real HLE smoke
 
 1. The pinned gated HLE Parquet URL and datasets-server endpoint both return HTTP 401 without authorized HLE access. No local HLE data file or approved HF key is available.
 2. Neither `~/secrets_and_keys/exa.key` nor `tavily.key` exists. The search interface is therefore fixture-only; no substitute backend was engineered.
-3. The first sandbox image build was stopped after its shared Python 3.11 base-image metadata pull timed out during concurrent Docker activity. Per coordination, it was not retried. The static isolation checks pass, but runtime sandbox validation remains pending until the shared base is local.
 
-No live provider inference was performed. These blockers must be cleared before the one-question four-model HLE smoke can be semantically valid.
+No live provider inference was performed during this milestone. The two remaining access blockers must be cleared before a real one-question HLE smoke can be semantically valid; the authorized next step is only a clearly labeled synthetic fixture smoke.
