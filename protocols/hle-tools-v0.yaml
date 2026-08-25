@@ -1,0 +1,28 @@
+protocol: hle-tools-v0
+dataset:
+  repo: cais/hle
+  revision: 5a81a4c7271a2a2a312b9a690f0c2fde837e4c29
+  split: test
+  count: 2500
+attempts: 1
+models:
+  reasoning_effort: high
+  temperature: 0
+  max_tokens_per_generation: 32768
+agent:
+  max_steps: 15
+  tools: [web_search, fetch_url, python_session]
+search:
+  preferred_backend: exa
+  scientific_search: false
+sandbox:
+  network: none
+  privileged: false
+  docker_socket: false
+  host_network: false
+scoring:
+  judge: openai/o3-mini-2025-01-31
+  failures_are_incorrect: true
+spend:
+  record: true
+  monetary_stop_gate: false

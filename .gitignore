@@ -173,8 +173,11 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
-# InspectAI log dir
+# InspectAI and protected HLE run data
 logs/
+protected/
+.hle-tools/
+artifacts/raw/
 
 # Vim files
 *.swp

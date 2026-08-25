@@ -1,0 +1,23 @@
+services:
+  default:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    command: ["tail", "-f", "/dev/null"]
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=256m
+      - /workspace:rw,nosuid,nodev,size=100m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    cpus: 2.0
+    mem_limit: 8g
+    user: "65532:65532"
+    environment:
+      HOME: /tmp
+      MPLBACKEND: Agg
