@@ -1,6 +1,11 @@
 import pytest
 
-from agent_baselines.evals.hle_tools_v0.scorer import parse_submission
+from agent_baselines.evals.hle_tools_v0.scorer import JUDGE_PROMPT, parse_submission
+
+
+def test_judge_prompt_formats_json_schema():
+    prompt = JUDGE_PROMPT.format(question="q", answer="a", target="t")
+    assert '{"correct": "yes" or "no"' in prompt
 
 
 def test_parse_submission():

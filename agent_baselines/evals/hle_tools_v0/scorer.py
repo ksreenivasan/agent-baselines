@@ -8,7 +8,7 @@ from inspect_ai.solver import TaskState
 
 JUDGE_PROMPT = """Judge whether the submitted answer matches the reference answer. Do not solve the
 question and do not demand wording that is absent from the reference. Return only JSON:
-{"correct": "yes" or "no", "reasoning": "brief equivalence explanation"}
+{{"correct": "yes" or "no", "reasoning": "brief equivalence explanation"}}
 
 Question: {question}
 Submitted answer: {answer}
