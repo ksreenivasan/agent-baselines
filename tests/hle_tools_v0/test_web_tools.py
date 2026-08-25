@@ -1,7 +1,6 @@
 import asyncio
 
 import httpx
-import pytest
 
 from agent_baselines.solvers.hle_tools_v0 import web_tools as module
 from agent_baselines.solvers.hle_tools_v0.web_tools import (
@@ -70,5 +69,8 @@ def test_fetch_timeout_is_returned_to_model(monkeypatch):
 def test_fetch_requires_prior_search(monkeypatch):
     monkeypatch.setenv("HLE_SEARCH_BACKEND", "fixture")
     reset_web_state()
-    with pytest.raises(ValueError, match="returned by web_search"):
-        asyncio.run(fetch_url()(url="https://example.com/not-returned"))
+    result = asyncio.run(fetch_url()(url="https://example.com/not-returned"))
+    assert result == {
+        "url": "https://example.com/not-returned",
+        "error": "url_not_from_search",
+    }

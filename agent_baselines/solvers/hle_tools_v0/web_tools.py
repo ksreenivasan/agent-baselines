@@ -84,7 +84,7 @@ def web_search() -> Tool:
             max_results: Number of results from 1 through 10.
         """
         if not query or len(query) > 512:
-            raise ValueError("query must contain 1-512 characters")
+            return {"error": "invalid_query_length"}
         max_results = max(1, min(int(max_results), 10))
         backend = os.environ.get("HLE_SEARCH_BACKEND", "fixture")
         if backend == "fixture":
@@ -123,7 +123,7 @@ def fetch_url() -> Tool:
             url: Exact HTTP(S) URL returned by an earlier web_search call.
         """
         if url not in _urls():
-            raise ValueError("fetch_url only accepts URLs returned by web_search")
+            return {"url": url, "error": "url_not_from_search"}
         if url == _FIXTURE_URL:
             return {
                 "url": url,
@@ -132,7 +132,7 @@ def fetch_url() -> Tool:
                 "truncated": False,
             }
         if not _public_http_url(url):
-            raise ValueError("URL does not resolve to a public HTTP(S) address")
+            return {"url": url, "error": "non_public_url"}
         try:
             async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
                 async with client.stream("GET", url, headers={"user-agent": "hle-tools-v0/0.1"}) as response:
