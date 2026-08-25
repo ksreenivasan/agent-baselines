@@ -229,6 +229,7 @@ def basic_agent(
     submit_description: str = DEFAULT_SUBMIT_DESCRIPTION,
     tool_call_format: Literal["text", "native"] = "native",
     model_override: str | Model | None = None,
+    final_step_submit_only: bool = False,
 ) -> Solver:
     """Basic ReAct agent.
 
@@ -266,6 +267,8 @@ def basic_agent(
         model_override: Optional model override. If provided, will use this
             model instead of the default one (prefer `--model` instead of this,
             unless this agent is being used in a multi-agent system).
+        final_step_submit_only: On the final step, expose only the configured
+            submission tool so the last model turn is reserved for an answer.
 
     Returns:
         Plan for agent.
@@ -302,17 +305,24 @@ def basic_agent(
                             limit=max_steps,
                             message=f"Reached max steps ({max_steps}).  Aborting.",
                         )
+                    tools_this_step = tools_for_generate
                     if cur_steps == max_steps:
                         state.messages.append(
                             ChatMessageUser(
-                                content="You have reached the maximum number of reasoning steps. Submit your final answer immediately; you will not get another chance."
+                                content="You have reached the final model turn. Submit your structured final answer and confidence now; no other tools are available."
                             )
                         )
+                        if final_step_submit_only:
+                            tools_this_step = [
+                                tool
+                                for tool in state.tools
+                                if ToolDef(tool).name == submit_name
+                            ]
                     # generate output and append assistant message
                     state.output = await get_model(model_override).generate(
                         input=state.messages,
                         cache=cache,
-                        tools=tools_for_generate,
+                        tools=tools_this_step,
                     )
                     state.messages.append(state.output.message)
 

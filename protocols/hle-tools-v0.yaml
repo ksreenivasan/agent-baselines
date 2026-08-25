@@ -15,6 +15,7 @@ models:
   timeout_rationale: uniform_high_reasoning_provider_ceiling
 agent:
   max_steps: 15
+  final_turn: submit_only
   tools: [web_search, fetch_url, python_session]
 search:
   preferred_backend: exa

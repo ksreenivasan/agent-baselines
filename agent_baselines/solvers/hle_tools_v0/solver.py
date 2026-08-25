@@ -35,4 +35,5 @@ def hle_tools_agent(max_steps: int = 15) -> Solver:
         max_steps=max_steps,
         max_tool_output=20_000,
         tool_call_format="native",
+        final_step_submit_only=True,
     )
