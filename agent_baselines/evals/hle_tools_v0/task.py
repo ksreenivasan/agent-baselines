@@ -25,6 +25,5 @@ def hle_tools_v0(
         scorer=hle_scorer(judge_model=judge_model),
         sandbox=("docker", str(_SANDBOX)),
         time_limit=1800,
-        token_limit=250_000,
         message_limit=80,
     )
