@@ -1,3 +1,5 @@
+import base64
+import io
 import json
 import os
 from pathlib import Path
@@ -6,6 +8,7 @@ from typing import Any
 from datasets import Dataset
 from inspect_ai.dataset import MemoryDataset, Sample
 from inspect_ai.model import ChatMessageUser, ContentImage, ContentText
+from PIL import Image
 
 HLE_DATASET_REVISION = "5a81a4c7271a2a2a312b9a690f0c2fde837e4c29"
 HLE_EXPECTED_COUNT = 2500
@@ -42,6 +45,13 @@ def row_to_sample(row: dict[str, Any]) -> Sample:
     if image:
         if not isinstance(image, str) or not image.startswith(("data:image/", "http://", "https://")):
             raise ValueError(f"invalid image for sample {row['id']}")
+        if image.startswith("data:image/"):
+            try:
+                encoded = image.split(",", 1)[1]
+                with Image.open(io.BytesIO(base64.b64decode(encoded, validate=True))) as decoded:
+                    decoded.verify()
+            except Exception as error:
+                raise ValueError(f"invalid image data for sample {row['id']}") from error
         content.append(ContentImage(image=image))
 
     answer_type = _normalize_answer_type(str(row["answer_type"]))
