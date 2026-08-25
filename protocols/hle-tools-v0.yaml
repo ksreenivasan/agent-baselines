@@ -10,8 +10,9 @@ models:
   temperature: provider_default_for_reasoning_models
   max_tokens_per_generation: 32768
   max_retries: 1
-  attempt_timeout_seconds: 180
-  total_request_timeout_seconds: 240
+  attempt_timeout_seconds: 600
+  total_request_timeout_seconds: 660
+  timeout_rationale: uniform_high_reasoning_provider_ceiling
 agent:
   max_steps: 15
   tools: [web_search, fetch_url, python_session]
