@@ -19,6 +19,13 @@ models:
     provider: openrouter
     api_model_id: qwen/qwen3.5-397b-a17b
     reasoning_effort: high
+    model_args:
+      reasoning_enabled: true
+      provider:
+        order: [Alibaba]
+        allow_fallbacks: false
+        require_parameters: true
+        data_collection: deny
 fallbacks:
   - label: glm-5.1-fallback
     inspect_id: openrouter/z-ai/glm-5.1
