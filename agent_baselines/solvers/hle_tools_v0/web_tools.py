@@ -98,9 +98,16 @@ def web_search() -> Tool:
                 }
             ]
         elif backend == "exa":
-            results = await _exa_search(query, max_results)
+            try:
+                results = await _exa_search(query, max_results)
+            except httpx.TimeoutException:
+                return {"backend": "exa", "error": "search_timeout"}
+            except httpx.HTTPStatusError as error:
+                return {"backend": "exa", "error": f"search_http_{error.response.status_code}"}
+            except httpx.HTTPError:
+                return {"backend": "exa", "error": "search_transport_error"}
         else:
-            raise RuntimeError(f"unsupported search backend: {backend}")
+            return {"backend": backend, "error": "unsupported_search_backend"}
         _urls().update(str(result["url"]) for result in results)
         return results
 
@@ -126,17 +133,23 @@ def fetch_url() -> Tool:
             }
         if not _public_http_url(url):
             raise ValueError("URL does not resolve to a public HTTP(S) address")
-        async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
-            async with client.stream("GET", url, headers={"user-agent": "hle-tools-v0/0.1"}) as response:
-                response.raise_for_status()
-                content_type = response.headers.get("content-type", "")
-                if not any(kind in content_type for kind in ("text/", "application/json", "application/xml")):
-                    raise ValueError(f"unsupported content type: {content_type}")
-                body = bytearray()
-                async for chunk in response.aiter_bytes():
-                    body.extend(chunk)
-                    if len(body) > 2_000_000:
-                        raise ValueError("response exceeds 2 MB")
+        try:
+            async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
+                async with client.stream("GET", url, headers={"user-agent": "hle-tools-v0/0.1"}) as response:
+                    if response.is_error:
+                        return {"url": url, "error": f"fetch_http_{response.status_code}"}
+                    content_type = response.headers.get("content-type", "")
+                    if not any(kind in content_type for kind in ("text/", "application/json", "application/xml")):
+                        return {"url": url, "error": "unsupported_content_type"}
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        body.extend(chunk)
+                        if len(body) > 2_000_000:
+                            return {"url": url, "error": "response_too_large"}
+        except httpx.TimeoutException:
+            return {"url": url, "error": "fetch_timeout"}
+        except httpx.HTTPError:
+            return {"url": url, "error": "fetch_transport_error"}
         text = bytes(body).decode(response.encoding or "utf-8", errors="replace")
         truncated = len(text) > 20_000
         return {"url": url, "status": response.status_code, "text": text[:20_000], "truncated": truncated}
