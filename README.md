@@ -62,6 +62,10 @@ See documentation in [asta-bench](https://github.com/allenai/asta-bench) for mor
 
 AstaBench includes several built-in solvers. Look in the `solvers` directory for setup and demo scripts.
 
+### Fork-local HLE-Verified conditions
+
+This public fork also contains two explicitly separate conditions over a pinned HLE-Verified Gold subset: [direct/no-tools](/solvers/hle-verified-direct/) and [with-tools](/solvers/hle-tools-v0/). They share data selection, multimodal loading, submission fields, and scoring, but their scores must be reported separately because the scaffolds differ.
+
 ### General agent baselines
 
 - [**Basic ReAct agent**](/solvers/react/): a simple ReAct implementation that uses LLM tool-calling in a loop. It supports all [AstaBench tool options](https://github.com/allenai/asta-bench?tab=readme-ov-file#tools-and-utilities) and configurable `max_steps`.

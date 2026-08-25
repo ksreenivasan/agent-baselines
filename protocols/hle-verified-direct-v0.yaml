@@ -1,0 +1,37 @@
+protocol: hle-verified-direct-v0
+protocol_revision: 2026-08-25-direct-one-generation
+dataset:
+  repo: skylenage-ai/HLE-Verified
+  revision: 0bc83643672d4f68a5f89998617a639d85e7318b
+  source_count: 2500
+  evaluation_class: Gold subset
+  evaluation_count: 668
+  split: repository_parquet_parts
+  answer_field: json.answer
+  question_field: json.question
+  multimodal_field: json.image
+attempts: 1
+models:
+  reasoning_effort: high
+  temperature: provider_default_for_reasoning_models
+  max_tokens_per_generation: 32768
+  max_retries: 1
+  attempt_timeout_seconds: 600
+  total_request_timeout_seconds: 660
+runtime:
+  prevent_host_idle_sleep: true
+  macos_command: caffeinate -i
+solver:
+  model_generations: 1
+  tools: []
+  agent_loop: false
+  submission: direct_json
+  submission_schema: [answer, confidence, explanation]
+scoring:
+  multiple_choice: deterministic_choice_comparison
+  exact_match: normalized_then_semantic_judge
+  judge: openai/o3-mini-2025-01-31
+  failures_are_incorrect: true
+reporting:
+  comparable_dataset: hle-tools-v0
+  scores_are_separate_scaffold_conditions: true
