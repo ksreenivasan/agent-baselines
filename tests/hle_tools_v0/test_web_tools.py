@@ -23,6 +23,7 @@ def test_fixture_search_then_fetch(monkeypatch):
 
 def test_hle_dataset_and_official_result_urls_are_blocked():
     assert _blocked_hle_url("https://huggingface.co/datasets/cais/hle")
+    assert _blocked_hle_url("https://huggingface.co/datasets/skylenage-ai/HLE-Verified")
     assert _blocked_hle_url("https://www.lastexam.ai/results")
     assert not _blocked_hle_url("https://example.com/science")
 

@@ -10,14 +10,16 @@ from agent_baselines.evals.hle_tools_v0.manifest import build_manifests
 
 def preflight() -> int:
     key_dir = Path.home() / "secrets_and_keys"
-    hle_path = os.environ.get("HLE_DATA_PATH")
+    hle_path = os.environ.get("HLE_VERIFIED_DATA_PATH")
     checks = {
         "fixture_rows": len(load_hle_dataset(fixture=True)),
         "docker_available": subprocess.run(
             ["docker", "version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         ).returncode
         == 0,
-        "hle_data_available": bool(hle_path and Path(hle_path).expanduser().is_file()),
+        "hle_verified_data_available": bool(
+            hle_path and Path(hle_path).expanduser().exists()
+        ),
         "exa_key_available": (key_dir / "exa.key").is_file(),
         "tavily_key_available": (key_dir / "tavily.key").is_file(),
         "provider_key_files": {
@@ -33,7 +35,9 @@ def preflight() -> int:
     checks["live_smoke_blockers"] = [
         name
         for name, blocked in {
-            "gated HLE data file is unavailable": not checks["hle_data_available"],
+            "pinned HLE-Verified snapshot is unavailable": not checks[
+                "hle_verified_data_available"
+            ],
             "Exa/Tavily credential is unavailable": not (
                 checks["exa_key_available"] or checks["tavily_key_available"]
             ),

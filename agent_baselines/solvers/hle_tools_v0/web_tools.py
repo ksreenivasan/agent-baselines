@@ -39,7 +39,14 @@ def _public_http_url(url: str) -> bool:
 
 def _blocked_hle_url(url: str) -> bool:
     lowered = url.lower()
-    return "huggingface.co/datasets/cais/hle" in lowered or "lastexam.ai" in lowered
+    return any(
+        blocked in lowered
+        for blocked in (
+            "huggingface.co/datasets/cais/hle",
+            "huggingface.co/datasets/skylenage-ai/hle-verified",
+            "lastexam.ai",
+        )
+    )
 
 
 async def _exa_search(query: str, max_results: int) -> list[dict[str, str | int]]:

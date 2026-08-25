@@ -5,7 +5,13 @@ import json
 from inspect_ai.model import ChatMessageUser, ContentImage
 from PIL import Image
 
-from agent_baselines.evals.hle_tools_v0.dataset import load_hle_dataset
+from agent_baselines.evals.hle_tools_v0 import dataset as dataset_module
+from agent_baselines.evals.hle_tools_v0.dataset import (
+    HLE_EXPECTED_COUNT,
+    HLE_EXPECTED_TOTAL,
+    load_hle_dataset,
+    load_hle_verified_rows,
+)
 
 
 def test_fixture_is_one_multimodal_sample():
@@ -20,6 +26,33 @@ def test_fixture_is_one_multimodal_sample():
     with Image.open(io.BytesIO(base64.b64decode(image.image.split(",", 1)[1]))) as decoded:
         assert decoded.size == (16, 16)
         assert decoded.convert("RGB").getpixel((0, 0)) == (0, 0, 255)
+
+
+def test_verified_schema_selects_gold_rows(monkeypatch, tmp_path):
+    rows = []
+    for index in range(HLE_EXPECTED_TOTAL):
+        verified_class = (
+            "Gold subset" if index < HLE_EXPECTED_COUNT else "Revision subset"
+        )
+        payload = {
+            "id": f"verified-{index}",
+            "Verified_Classes": verified_class,
+            "question": f"question {index}",
+            "answer": str(index),
+            "answer_type": "exactMatch",
+            "image": "",
+            "category": "Math",
+            "raw_subject": "Math",
+        }
+        rows.append({**payload, "json": json.dumps(payload)})
+    monkeypatch.setattr(dataset_module, "_load_rows", lambda path: rows)
+
+    selected = load_hle_verified_rows(tmp_path)
+
+    assert len(selected) == HLE_EXPECTED_COUNT
+    assert selected[0]["id"] == "verified-0"
+    assert selected[-1]["id"] == f"verified-{HLE_EXPECTED_COUNT - 1}"
+    assert {row["Verified_Classes"] for row in selected} == {"Gold subset"}
 
 
 def test_manifest_filters_and_preserves_order(tmp_path):

@@ -4,12 +4,16 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from datasets import Dataset
+from .dataset import (
+    HLE_DATASET_REPO,
+    HLE_DATASET_REVISION,
+    HLE_EVAL_CLASS,
+    HLE_EXPECTED_COUNT,
+    load_hle_verified_rows,
+)
 
-from .dataset import HLE_DATASET_REVISION, HLE_EXPECTED_COUNT
-
-PILOT_SEED = "hle-tools-v0-pilot-50"
-SMOKE_SEED = "hle-tools-v0-smoke-1"
+PILOT_SEED = "hle-tools-v0-hle-verified-gold-pilot-50"
+SMOKE_SEED = "hle-tools-v0-hle-verified-gold-smoke-1"
 
 
 def _rank(seed: str, sample_id: str) -> str:
@@ -29,9 +33,11 @@ def _largest_remainder(counts: Counter[tuple[str, str]], size: int) -> dict[tupl
 
 def build_manifests(data_path: str | Path, output_dir: str | Path) -> dict[str, Any]:
     data_path = Path(data_path).expanduser().resolve()
-    rows = list(Dataset.from_parquet(str(data_path)))
+    rows = load_hle_verified_rows(data_path)
     if len(rows) != HLE_EXPECTED_COUNT:
-        raise ValueError(f"expected {HLE_EXPECTED_COUNT} rows, got {len(rows)}")
+        raise ValueError(
+            f"expected {HLE_EXPECTED_COUNT} evaluation rows, got {len(rows)}"
+        )
 
     cells = Counter((str(row["category"]), str(row["answer_type"])) for row in rows)
     quotas = _largest_remainder(cells, 50)
@@ -76,15 +82,30 @@ def build_manifests(data_path: str | Path, output_dir: str | Path) -> dict[str, 
 
     output_dir = Path(output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    smoke = {"name": "smoke-1", "dataset_revision": HLE_DATASET_REVISION, "ids": [smoke_id]}
-    pilot = {"name": "pilot-50", "dataset_revision": HLE_DATASET_REVISION, "ids": pilot_ids}
+    smoke = {
+        "name": "smoke-1",
+        "dataset_repo": HLE_DATASET_REPO,
+        "dataset_revision": HLE_DATASET_REVISION,
+        "dataset_class": HLE_EVAL_CLASS,
+        "ids": [smoke_id],
+    }
+    pilot = {
+        "name": "pilot-50",
+        "dataset_repo": HLE_DATASET_REPO,
+        "dataset_revision": HLE_DATASET_REVISION,
+        "dataset_class": HLE_EVAL_CLASS,
+        "ids": pilot_ids,
+    }
     (output_dir / "smoke-1.json").write_text(json.dumps(smoke, indent=2) + "\n")
     (output_dir / "pilot-50.json").write_text(json.dumps(pilot, indent=2) + "\n")
 
     answer_counts = Counter(str(row["answer_type"]) for row in selected)
     category_counts = Counter(str(row["category"]) for row in selected)
     audit = {
+        "dataset_repo": HLE_DATASET_REPO,
         "dataset_revision": HLE_DATASET_REVISION,
+        "dataset_class": HLE_EVAL_CLASS,
+        "evaluation_pool_rows": len(rows),
         "pilot_size": len(pilot_ids),
         "pilot_manifest_sha256": hashlib.sha256("\n".join(pilot_ids).encode()).hexdigest(),
         "smoke_manifest_sha256": hashlib.sha256(smoke_id.encode()).hexdigest(),

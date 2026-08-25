@@ -1,8 +1,8 @@
 # `hle-tools-v0`: proposal and smoke-test-first implementation plan
 
-**Status:** execution authorized through the one-question smoke and stratified 50-question pilot; a full 2,500-question run and any push remain unauthorized.
+**Status:** this original CAIS-HLE proposal is retained as design history. The active dataset and runtime amendment is `protocols/hle-tools-v0.yaml`: `skylenage-ai/HLE-Verified@0bc83643672d4f68a5f89998617a639d85e7318b`, Gold subset, host idle sleep prevented. Only offline checks and at most one GPT smoke are currently authorized; the 50-question pilot, other model lanes, expanded evaluation, full evaluation, and push are not authorized.
 
-**Planning snapshot:** 2026-08-25. Availability and pricing are mutable and must be rechecked without inference immediately before a run.
+**Planning snapshot:** 2026-08-25. Dataset-specific CAIS/HLE commands and hashes below are historical and must not be used for a new run. Availability and pricing are mutable and must be rechecked without inference immediately before a run.
 
 ### User execution overrides (2026-08-25)
 

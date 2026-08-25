@@ -1,5 +1,7 @@
 # hle-tools-v0 real one-question smoke
 
+> Historical CAIS-HLE evidence only. The active protocol now uses pinned HLE-Verified Gold data; this matrix is not release evidence for the migrated dataset. See `HLE_VERIFIED_MIGRATION.md`.
+
 Date: 2026-08-25
 
 Authoritative code revision: `a080cea`

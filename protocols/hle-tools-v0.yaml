@@ -1,10 +1,15 @@
 protocol: hle-tools-v0
-protocol_revision: 2026-08-25-submit-wrapper-alignment
+protocol_revision: 2026-08-25-hle-verified-gold-host-awake
 dataset:
-  repo: cais/hle
-  revision: 5a81a4c7271a2a2a312b9a690f0c2fde837e4c29
-  split: test
-  count: 2500
+  repo: skylenage-ai/HLE-Verified
+  revision: 0bc83643672d4f68a5f89998617a639d85e7318b
+  source_count: 2500
+  evaluation_class: Gold subset
+  evaluation_count: 668
+  split: repository_parquet_parts
+  answer_field: json.answer
+  question_field: json.question
+  multimodal_field: json.image
 attempts: 1
 models:
   reasoning_effort: high
@@ -16,6 +21,10 @@ models:
   attempt_timeout_seconds: 600
   total_request_timeout_seconds: 660
   timeout_rationale: uniform_high_reasoning_provider_ceiling
+runtime:
+  prevent_host_idle_sleep: true
+  macos_command: caffeinate -i
+  rationale: inspect_anyio_timeouts_require_runnable_event_loop
 agent:
   max_steps: 15
   final_turn: submit_only
