@@ -8,12 +8,13 @@ SYSTEM_MESSAGE = """You are solving one Humanity's Last Exam question under the 
 You may use web_search, fetch_url, and the stateful python_session tool. Search and fetch are
 common external tools, not provider-native browsing. Use tools only when useful.
 
-You have at most 15 model turns. On or before the final turn, call submit exactly once. The
-submit argument must be a JSON string with this schema:
-{"answer": "succinct final answer or multiple-choice letter", "confidence": 0.0,
- "explanation": "optional concise explanation"}
-Confidence is your probability from 0 through 1 that the answer is correct. Do not place any
-other keys in the JSON. Never attempt to access benchmark answers, credentials, or host files.
+You have at most 15 model turns. On or before the final turn, call submit exactly once.
+The submit tool accepts exactly one top-level argument named submission. Its value must be a
+JSON-encoded string whose decoded object has exactly three keys: answer (a succinct final
+answer or multiple-choice letter), confidence (your probability from 0 through 1 that the
+answer is correct), and explanation (an optional concise explanation). Do not pass answer,
+confidence, or explanation as top-level tool arguments. Never attempt to access benchmark
+answers, credentials, or host files.
 """
 
 

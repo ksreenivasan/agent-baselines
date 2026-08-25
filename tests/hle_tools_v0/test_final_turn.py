@@ -9,6 +9,7 @@ from inspect_ai.model import (
 from inspect_ai.scorer import match
 from inspect_ai.tool import ToolCall, tool
 
+from agent_baselines.solvers.hle_tools_v0.solver import hle_tools_agent
 from agent_baselines.solvers.react.basic_agent import basic_agent
 
 
@@ -65,3 +66,43 @@ def test_final_turn_exposes_only_submit():
     assert len(observed_tools) == 15
     assert "dummy_tool" in observed_tools[0]
     assert observed_tools[-1] == ["submit"]
+
+
+def test_hle_prompt_and_submit_tool_use_submission_string():
+    submission = '{"answer":"1","confidence":1.0,"explanation":"fixture"}'
+
+    def output(messages, tools, tool_choice, config):
+        assert "exactly one top-level argument named submission" in messages[0].text
+        assert [tool.name for tool in tools] == ["submit"]
+        assert tools[0].parameters.required == ["submission"]
+        return ModelOutput(
+            model="mockllm/model",
+            choices=[
+                ChatCompletionChoice(
+                    message=ChatMessageAssistant(
+                        content="",
+                        model="mockllm/model",
+                        tool_calls=[
+                            ToolCall(
+                                id="submit-shaped",
+                                function="submit",
+                                arguments={"submission": submission},
+                            )
+                        ],
+                    ),
+                    stop_reason="tool_calls",
+                )
+            ],
+        )
+
+    logs = eval(
+        Task(
+            dataset=MemoryDataset([Sample(input="test", target=submission)]),
+            solver=hle_tools_agent(max_steps=1),
+            scorer=match(),
+        ),
+        model=get_model("mockllm/model", custom_outputs=output, memoize=False),
+        display="none",
+        sandbox="local",
+    )
+    assert logs[0].status == "success"

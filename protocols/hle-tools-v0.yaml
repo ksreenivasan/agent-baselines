@@ -1,5 +1,5 @@
 protocol: hle-tools-v0
-protocol_revision: 2026-08-25-no-cumulative-token-limit
+protocol_revision: 2026-08-25-submit-wrapper-alignment
 dataset:
   repo: cais/hle
   revision: 5a81a4c7271a2a2a312b9a690f0c2fde837e4c29
