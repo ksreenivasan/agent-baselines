@@ -1,0 +1,26 @@
+{
+  "dataset_revision": "5a81a4c7271a2a2a312b9a690f0c2fde837e4c29",
+  "dataset_file_sha256": "6d0ee0602e8aea6b159509577e884f48ecac7b8e3f6822a35f51335a446c726a",
+  "dataset_rows": 2500,
+  "pilot_answer_types": {
+    "exactMatch": 38,
+    "multipleChoice": 12
+  },
+  "pilot_categories": {
+    "Biology/Medicine": 5,
+    "Chemistry": 3,
+    "Computer Science/AI": 4,
+    "Engineering": 3,
+    "Humanities/Social Science": 5,
+    "Math": 21,
+    "Other": 4,
+    "Physics": 5
+  },
+  "pilot_image_rows": 8,
+  "pilot_manifest_sha256": "fbbe4fefc56ce571388b8a534387b659e41e955ef4da0976260adee91f642ec4",
+  "pilot_size": 50,
+  "selection_seed": "hle-tools-v0-pilot-50",
+  "smoke_image_rows": 1,
+  "smoke_manifest_sha256": "f55879af1744b19b6bdef5cee24ab91c7be1e0764e80467e23700a70c924208a",
+  "smoke_size": 1
+}

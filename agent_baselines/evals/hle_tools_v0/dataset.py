@@ -72,6 +72,7 @@ def load_hle_dataset(
     path: str | Path | None = None,
     *,
     fixture: bool = False,
+    manifest_path: str | Path | None = None,
     limit: int | None = None,
 ) -> MemoryDataset:
     if path is None:
@@ -94,6 +95,14 @@ def load_hle_dataset(
         raise ValueError(
             f"expected {HLE_EXPECTED_COUNT} rows for {HLE_DATASET_REVISION}, got {len(rows)}"
         )
+    if manifest_path is not None:
+        manifest = json.loads(Path(manifest_path).expanduser().read_text())
+        ids = [str(sample_id) for sample_id in manifest["ids"]]
+        by_id = {str(row["id"]): row for row in rows}
+        missing = [sample_id for sample_id in ids if sample_id not in by_id]
+        if missing:
+            raise ValueError(f"manifest contains {len(missing)} unknown IDs")
+        rows = [by_id[sample_id] for sample_id in ids]
     if limit is not None:
         rows = rows[:limit]
     samples = [row_to_sample(row) for row in rows]

@@ -1,5 +1,6 @@
 import base64
 import io
+import json
 
 from inspect_ai.model import ChatMessageUser, ContentImage
 from PIL import Image
@@ -19,3 +20,10 @@ def test_fixture_is_one_multimodal_sample():
     with Image.open(io.BytesIO(base64.b64decode(image.image.split(",", 1)[1]))) as decoded:
         assert decoded.size == (16, 16)
         assert decoded.convert("RGB").getpixel((0, 0)) == (0, 0, 255)
+
+
+def test_manifest_filters_and_preserves_order(tmp_path):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"ids": ["fixture-multimodal-001"]}))
+    dataset = load_hle_dataset(fixture=True, manifest_path=manifest)
+    assert [sample.id for sample in dataset] == ["fixture-multimodal-001"]

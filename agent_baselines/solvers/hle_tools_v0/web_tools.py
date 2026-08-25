@@ -1,3 +1,4 @@
+import asyncio
 import ipaddress
 import os
 import socket
@@ -36,21 +37,30 @@ def _public_http_url(url: str) -> bool:
     return True
 
 
+def _blocked_hle_url(url: str) -> bool:
+    lowered = url.lower()
+    return "huggingface.co/datasets/cais/hle" in lowered or "lastexam.ai" in lowered
+
+
 async def _exa_search(query: str, max_results: int) -> list[dict[str, str | int]]:
     key = os.environ.get("EXA_API_KEY")
     if not key:
         raise RuntimeError("EXA_API_KEY is unavailable; live search is blocked")
     async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(
-            "https://api.exa.ai/search",
-            headers={"x-api-key": key},
-            json={"query": query, "numResults": max_results, "type": "auto"},
-        )
+        for attempt in range(2):
+            response = await client.post(
+                "https://api.exa.ai/search",
+                headers={"x-api-key": key},
+                json={"query": query, "numResults": max_results, "type": "auto"},
+            )
+            if response.status_code != 429 or attempt == 1:
+                break
+            await asyncio.sleep(2)
         response.raise_for_status()
     results = []
     for rank, item in enumerate(response.json().get("results", []), start=1):
         url = str(item.get("url", ""))
-        if not _public_http_url(url):
+        if not _public_http_url(url) or _blocked_hle_url(url):
             continue
         results.append(
             {

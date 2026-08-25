@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 
 from agent_baselines.evals.hle_tools_v0.dataset import load_hle_dataset
+from agent_baselines.evals.hle_tools_v0.manifest import build_manifests
 
 
 def preflight() -> int:
@@ -45,9 +46,16 @@ def preflight() -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["preflight"])
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("preflight")
+    manifest_parser = subparsers.add_parser("build-manifests")
+    manifest_parser.add_argument("--data-path", required=True)
+    manifest_parser.add_argument("--output-dir", required=True)
     args = parser.parse_args()
-    raise SystemExit(preflight())
+    if args.command == "preflight":
+        raise SystemExit(preflight())
+    audit = build_manifests(args.data_path, args.output_dir)
+    print(json.dumps(audit, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":
