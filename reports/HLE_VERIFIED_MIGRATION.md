@@ -113,6 +113,22 @@ The loader now requires all 2,500 unique rows, validates each structured JSON re
 
 Former protected HLE data, manifests, smoke logs, and the aborted-pilot diagnostic remain untouched and excluded from new aggregates.
 
-## Verification and run status
+## Verification and GPT smoke status
 
-Focused schema/selection and URL-block tests plus the complete offline HLE test suite pass. A single GPT smoke is the only permitted live follow-up, and it must run under `caffeinate -i` against the new smoke manifest. The 50-question pilot and non-GPT lanes remain blocked pending review of that smoke.
+Focused schema/selection and URL-block tests plus the complete offline HLE test suite pass: 17 tests passed. The real loader independently produced 668 unique Gold samples, the protected smoke resolved to one multimodal sample, and a clean regeneration reproduced both protected manifests byte for byte.
+
+One authorized GPT smoke ran against the new multimodal Gold smoke manifest under protocol revision `2026-08-25-hle-verified-gold-host-awake` and code `1621538`:
+
+- Inspect status: success
+- Host-awake guard: `caffeinate -i`; the macOS power log records its sleep-prevention assertion for the full 3:17 command lifetime
+- Wall time: 3:10
+- Agent turns: 15
+- Tools: 25 search, 3 fetch, 2 Python, 1 submit
+- Structured submission: valid; confidence 0.18
+- Judge: invoked successfully
+- Correctness: incorrect on this one item
+- Solver usage: 215,802 tokens (42,171 uncached input, 168,243 cached input, 5,388 output, including 4,285 reasoning)
+- HTTP retries, Exa 429s, search/fetch transport errors, and unresolved judge errors: none
+- Secret scan: clean; sandbox/container cleanup: clean
+
+This successful bounded run is consistent with the host-suspension diagnosis and does not establish that OpenAI or Inspect had a timeout defect. It is plumbing evidence, not an accuracy estimate. The 50-question pilot and non-GPT lanes remain blocked; neither was launched during this migration.
