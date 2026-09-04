@@ -21,6 +21,7 @@ dependencies = [
     { name = "inspect-ai" },
     { name = "openai" },
     { name = "pillow" },
+    { name = "pydantic" },
     { name = "pytest" },
     { name = "pyyaml" },
 ]
@@ -33,6 +34,7 @@ requires-dist = [
     { name = "inspect-ai", specifier = "==0.3.203" },
     { name = "openai", specifier = "==2.30.0" },
     { name = "pillow", specifier = ">=10,<12" },
+    { name = "pydantic", specifier = ">=2,<3" },
     { name = "pytest", specifier = ">=8,<9" },
     { name = "pyyaml", specifier = ">=6,<7" },
 ]

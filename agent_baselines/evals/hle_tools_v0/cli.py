@@ -10,15 +10,25 @@ from agent_baselines.evals.hle_tools_v0.manifest import build_manifests
 
 def preflight() -> int:
     key_dir = Path.home() / "secrets_and_keys"
-    hle_path = os.environ.get("HLE_VERIFIED_DATA_PATH")
+    hle_path = os.environ.get("HLE_DATA_PATH")
+    hle_revision = os.environ.get("HLE_DATASET_REVISION")
+    hle_verified_path = os.environ.get("HLE_VERIFIED_DATA_PATH")
     checks = {
         "fixture_rows": len(load_hle_dataset(fixture=True)),
         "docker_available": subprocess.run(
             ["docker", "version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         ).returncode
         == 0,
-        "hle_verified_data_available": bool(
+        "hle_standard_data_available": bool(
             hle_path and Path(hle_path).expanduser().exists()
+        ),
+        "hle_standard_revision_pinned": bool(
+            hle_revision
+            and len(hle_revision) == 40
+            and all(character in "0123456789abcdef" for character in hle_revision)
+        ),
+        "hle_verified_data_available": bool(
+            hle_verified_path and Path(hle_verified_path).expanduser().exists()
         ),
         "exa_key_available": (key_dir / "exa.key").is_file(),
         "tavily_key_available": (key_dir / "tavily.key").is_file(),
@@ -35,8 +45,11 @@ def preflight() -> int:
     checks["live_smoke_blockers"] = [
         name
         for name, blocked in {
-            "pinned HLE-Verified snapshot is unavailable": not checks[
-                "hle_verified_data_available"
+            "standard HLE snapshot is unavailable": not checks[
+                "hle_standard_data_available"
+            ],
+            "standard HLE snapshot revision is not pinned": not checks[
+                "hle_standard_revision_pinned"
             ],
             "Exa/Tavily credential is unavailable": not (
                 checks["exa_key_available"] or checks["tavily_key_available"]

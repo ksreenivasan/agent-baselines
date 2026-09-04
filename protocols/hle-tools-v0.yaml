@@ -1,15 +1,19 @@
 protocol: hle-tools-v0
-protocol_revision: 2026-08-25-hle-verified-gold-host-awake
+protocol_revision: 2026-09-04-aa-hle-prompt-and-judge
 dataset:
-  repo: skylenage-ai/HLE-Verified
-  revision: 0bc83643672d4f68a5f89998617a639d85e7318b
+  default_variant: standard
+  repo: cais/hle
+  release: May 2025
+  revision: required_immutable_commit_via_HLE_DATASET_REVISION
   source_count: 2500
-  evaluation_class: Gold subset
-  evaluation_count: 668
-  split: repository_parquet_parts
-  answer_field: json.answer
-  question_field: json.question
-  multimodal_field: json.image
+  selection: text_only
+  evaluation_count: 2158
+  optional_variant:
+    name: verified
+    repo: skylenage-ai/HLE-Verified
+    revision: 0bc83643672d4f68a5f89998617a639d85e7318b
+    evaluation_class: Gold subset
+    evaluation_count: 668
 attempts: 1
 models:
   reasoning_effort: high
@@ -25,6 +29,12 @@ runtime:
   prevent_host_idle_sleep: true
   macos_command: caffeinate -i
   rationale: inspect_anyio_timeouts_require_runnable_event_loop
+smoke_test:
+  required_before_eval: true
+  checks: [web_search, fetch_url, python_session, submit, model_endpoint, judge_endpoint]
+  live_search_must_not_use_fixture: true
+  failure: warn_and_exit_status_2
+  explicit_override: --skip-smoke-test
 agent:
   max_steps: 15
   final_turn: submit_only
@@ -38,8 +48,11 @@ sandbox:
   docker_socket: false
   host_network: false
 scoring:
-  judge: openai/o3-mini-2025-01-31
-  failures_are_incorrect: true
+  judge: openai/gpt-5.6-luna
+  judge_reasoning_effort: medium
+  prompt: artificial_analysis_hle_equality_checker
+  response_input: complete_solver_response
+  judge_failures: sample_error
 spend:
   record: true
   monetary_stop_gate: false

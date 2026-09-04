@@ -230,6 +230,7 @@ def basic_agent(
     tool_call_format: Literal["text", "native"] = "native",
     model_override: str | Model | None = None,
     final_step_submit_only: bool = False,
+    final_step_message: str = "You have reached the final model turn. Submit your structured final answer and confidence now; no other tools are available.",
 ) -> Solver:
     """Basic ReAct agent.
 
@@ -269,6 +270,8 @@ def basic_agent(
             unless this agent is being used in a multi-agent system).
         final_step_submit_only: On the final step, expose only the configured
             submission tool so the last model turn is reserved for an answer.
+        final_step_message: User message appended immediately before the final
+            model turn.
 
     Returns:
         Plan for agent.
@@ -308,9 +311,7 @@ def basic_agent(
                     tools_this_step = tools_for_generate
                     if cur_steps == max_steps:
                         state.messages.append(
-                            ChatMessageUser(
-                                content="You have reached the final model turn. Submit your structured final answer and confidence now; no other tools are available."
-                            )
+                            ChatMessageUser(content=final_step_message)
                         )
                         if final_step_submit_only:
                             tools_this_step = [

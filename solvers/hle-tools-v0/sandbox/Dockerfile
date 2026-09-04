@@ -3,6 +3,8 @@ FROM python:3.11-slim-bookworm
 RUN python -m venv /opt/inspect_tool_support \
     && /opt/inspect_tool_support/bin/pip install --no-cache-dir \
        inspect-tool-support \
+       mcp==1.29.1 \
+       ipykernel==6.30.1 \
        jupyter_client==8.6.3 \
        jupyter_kernel_gateway==3.0.1 \
        numpy==1.26.4 \
@@ -11,6 +13,8 @@ RUN python -m venv /opt/inspect_tool_support \
        sympy==1.14.0 \
        networkx==3.5 \
        matplotlib==3.10.7 \
+    && /opt/inspect_tool_support/bin/python -m ipykernel install \
+       --sys-prefix --name python3 \
     && /opt/inspect_tool_support/bin/inspect-tool-support post-install
 
 ENV PATH="/opt/inspect_tool_support/bin:${PATH}" \

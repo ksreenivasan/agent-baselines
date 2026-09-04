@@ -5,10 +5,10 @@ from pathlib import Path
 from typing import Any
 
 from .dataset import (
-    HLE_DATASET_REPO,
-    HLE_DATASET_REVISION,
     HLE_EVAL_CLASS,
-    HLE_EXPECTED_COUNT,
+    HLE_VERIFIED_DATASET_REPO,
+    HLE_VERIFIED_DATASET_REVISION,
+    HLE_VERIFIED_EXPECTED_COUNT,
     load_hle_verified_rows,
 )
 
@@ -34,9 +34,9 @@ def _largest_remainder(counts: Counter[tuple[str, str]], size: int) -> dict[tupl
 def build_manifests(data_path: str | Path, output_dir: str | Path) -> dict[str, Any]:
     data_path = Path(data_path).expanduser().resolve()
     rows = load_hle_verified_rows(data_path)
-    if len(rows) != HLE_EXPECTED_COUNT:
+    if len(rows) != HLE_VERIFIED_EXPECTED_COUNT:
         raise ValueError(
-            f"expected {HLE_EXPECTED_COUNT} evaluation rows, got {len(rows)}"
+            f"expected {HLE_VERIFIED_EXPECTED_COUNT} evaluation rows, got {len(rows)}"
         )
 
     cells = Counter((str(row["category"]), str(row["answer_type"])) for row in rows)
@@ -84,15 +84,15 @@ def build_manifests(data_path: str | Path, output_dir: str | Path) -> dict[str, 
     output_dir.mkdir(parents=True, exist_ok=True)
     smoke = {
         "name": "smoke-1",
-        "dataset_repo": HLE_DATASET_REPO,
-        "dataset_revision": HLE_DATASET_REVISION,
+        "dataset_repo": HLE_VERIFIED_DATASET_REPO,
+        "dataset_revision": HLE_VERIFIED_DATASET_REVISION,
         "dataset_class": HLE_EVAL_CLASS,
         "ids": [smoke_id],
     }
     pilot = {
         "name": "pilot-50",
-        "dataset_repo": HLE_DATASET_REPO,
-        "dataset_revision": HLE_DATASET_REVISION,
+        "dataset_repo": HLE_VERIFIED_DATASET_REPO,
+        "dataset_revision": HLE_VERIFIED_DATASET_REVISION,
         "dataset_class": HLE_EVAL_CLASS,
         "ids": pilot_ids,
     }
@@ -102,8 +102,8 @@ def build_manifests(data_path: str | Path, output_dir: str | Path) -> dict[str, 
     answer_counts = Counter(str(row["answer_type"]) for row in selected)
     category_counts = Counter(str(row["category"]) for row in selected)
     audit = {
-        "dataset_repo": HLE_DATASET_REPO,
-        "dataset_revision": HLE_DATASET_REVISION,
+        "dataset_repo": HLE_VERIFIED_DATASET_REPO,
+        "dataset_revision": HLE_VERIFIED_DATASET_REVISION,
         "dataset_class": HLE_EVAL_CLASS,
         "evaluation_pool_rows": len(rows),
         "pilot_size": len(pilot_ids),

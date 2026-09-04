@@ -28,7 +28,9 @@ def test_final_turn_exposes_only_submit():
     def output(messages, tools, tool_choice, config):
         observed_tools.append([tool.name for tool in tools])
         if len(observed_tools) < 15:
-            return ModelOutput.from_content(model="mockllm/model", content="still working")
+            return ModelOutput.from_content(
+                model="mockllm/model", content="still working"
+            )
         return ModelOutput(
             model="mockllm/model",
             choices=[
@@ -68,11 +70,12 @@ def test_final_turn_exposes_only_submit():
     assert observed_tools[-1] == ["submit"]
 
 
-def test_hle_prompt_and_submit_tool_use_submission_string():
-    submission = '{"answer":"1","confidence":1.0,"explanation":"fixture"}'
+def test_hle_prompt_and_submit_tool_use_plain_hle_response():
+    submission = "Explanation: counted\nExact Answer: 1\nConfidence: 100%"
 
     def output(messages, tools, tool_choice, config):
-        assert "exactly one top-level argument named submission" in messages[0].text
+        assert "Exact Answer: {your succinct, final answer}" in messages[0].text
+        assert "Do not JSON-encode" in messages[1].text
         assert [tool.name for tool in tools] == ["submit"]
         assert tools[0].parameters.required == ["submission"]
         return ModelOutput(

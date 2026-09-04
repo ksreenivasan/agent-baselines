@@ -1,7 +1,7 @@
 from inspect_ai import eval
 from inspect_ai.model import ContentImage, ModelOutput, get_model
 
-from agent_baselines.evals.hle_verified_direct.task import hle_verified_direct
+from agent_baselines.evals.hle_direct.task import hle_direct
 
 
 def test_direct_condition_is_one_tool_free_multimodal_generation():
@@ -11,7 +11,7 @@ def test_direct_condition_is_one_tool_free_multimodal_generation():
         nonlocal calls
         calls += 1
         assert tools == []
-        assert "one response without using tools" in messages[0].text
+        assert "Exact Answer: {your succinct, final answer}" in messages[0].text
         assert any(
             isinstance(item, ContentImage)
             for message in messages
@@ -19,11 +19,25 @@ def test_direct_condition_is_one_tool_free_multimodal_generation():
         )
         return ModelOutput.from_content(
             model="mockllm/model",
-            content='{"answer":"1","confidence":0.9,"explanation":"fixture"}',
+            content="Explanation: counted\nExact Answer: 1\nConfidence: 90%",
         )
 
+    def judge_output(messages, tools, tool_choice, config):
+        assert config.reasoning_effort == "medium"
+        assert config.response_schema.name == "hle_equality_judgment"
+        assert "Exact Answer: 1" in messages[-1].text
+        return ModelOutput.from_content(
+            model="mockllm/judge",
+            content=(
+                '{"extracted_final_answer":"1","reasoning":"matches",'
+                '"correct":"yes","confidence":90,"strict":true}'
+            ),
+        )
+
+    judge = get_model("mockllm/judge", custom_outputs=judge_output, memoize=False)
+
     logs = eval(
-        hle_verified_direct(fixture=True),
+        hle_direct(fixture=True, judge_model=judge),
         model=get_model("mockllm/model", custom_outputs=output, memoize=False),
         display="none",
     )

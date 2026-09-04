@@ -4,8 +4,8 @@ This fork maintains two separate evaluation conditions over the same pinned HLE-
 
 | Condition | Task | Model generations | Model-visible tools | Submission path |
 |---|---|---:|---|---|
-| Direct/no-tools | `agent_baselines/evals/hle_verified_direct/task.py@hle_verified_direct` | exactly 1 | none | response is the JSON object |
-| With-tools | `agent_baselines/evals/hle_tools_v0/task.py@hle_tools_v0` | at most 15 | Exa search, controlled fetch, stateful sandboxed Python, inherited submit on the final turn | inherited `submission` string containing the same JSON object |
+| Direct/no-tools | `agent_baselines/evals/hle_verified_direct/task.py@hle_verified_direct` | exactly 1 | none | canonical HLE text response |
+| With-tools | `agent_baselines/evals/hle_tools_v0/task.py@hle_tools_v0` with `dataset_variant="verified"` | at most 15 | Exa search, controlled fetch, stateful sandboxed Python, inherited submit on the final turn | `submission` string containing the canonical HLE text response |
 
 Both conditions use:
 
@@ -13,12 +13,12 @@ Both conditions use:
 - the card-recommended 668-row Gold subset;
 - the same protected smoke and pilot manifests;
 - the same text/image serialization and answer-type metadata;
-- the same decoded schema: `answer`, `confidence`, and `explanation`;
-- deterministic multiple-choice comparison and normalized/semantic exact-answer judging.
+- the canonical answer-type-specific HLE response prompt;
+- the complete-response HLE equality-checker prompt with GPT-5.6 Luna at medium reasoning effort.
 
 Their scores are **separate scaffold conditions**. Direct and with-tools results must not be merged or presented as interchangeable HLE scores.
 
-The direct task performs one solver-model generation. Its scorer may separately call the pinned semantic judge when an exact answer is not a normalized string match; that evaluator call is not a solver tool or a second attempt by the evaluated model.
+The direct task performs one solver-model generation. Its scorer separately calls the equality judge for every response; that evaluator call is not a solver tool or a second attempt by the evaluated model. Judge output is schema-constrained JSON, but evaluated-model output is plain HLE-formatted text.
 
 ## Offline check
 

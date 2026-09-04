@@ -1,19 +1,13 @@
-from pathlib import Path
-
 from inspect_ai import Task, task
 from inspect_ai.model import Model
 
 from agent_baselines.evals.hle_tools_v0.dataset import load_hle_dataset
 from agent_baselines.evals.hle_tools_v0.scorer import DEFAULT_JUDGE_MODEL, hle_scorer
-from agent_baselines.solvers.hle_tools_v0.solver import hle_tools_agent
-
-_SANDBOX = (
-    Path(__file__).parents[3] / "solvers" / "hle-tools-v0" / "sandbox" / "compose.yaml"
-)
+from agent_baselines.solvers.hle_direct.solver import hle_direct_agent
 
 
 @task
-def hle_tools_v0(
+def hle_direct(
     fixture: bool = False,
     data_path: str | None = None,
     manifest_path: str | None = None,
@@ -23,6 +17,7 @@ def hle_tools_v0(
     judge_model: str | Model = DEFAULT_JUDGE_MODEL,
     judge_reasoning_effort: str = "medium",
 ) -> Task:
+    """AA-compatible, tool-free HLE evaluation; standard text-only HLE by default."""
     return Task(
         dataset=load_hle_dataset(
             data_path,
@@ -32,12 +27,11 @@ def hle_tools_v0(
             dataset_variant=dataset_variant,
             dataset_revision=dataset_revision,
         ),
-        solver=hle_tools_agent(max_steps=15),
+        solver=hle_direct_agent(),
         scorer=hle_scorer(
             judge_model=judge_model,
             judge_reasoning_effort=judge_reasoning_effort,
         ),
-        sandbox=("docker", str(_SANDBOX)),
         time_limit=1800,
-        message_limit=80,
+        message_limit=10,
     )

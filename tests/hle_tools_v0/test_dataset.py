@@ -2,14 +2,18 @@ import base64
 import io
 import json
 
+import pytest
 from inspect_ai.model import ChatMessageUser, ContentImage
 from PIL import Image
 
 from agent_baselines.evals.hle_tools_v0 import dataset as dataset_module
 from agent_baselines.evals.hle_tools_v0.dataset import (
-    HLE_EXPECTED_COUNT,
-    HLE_EXPECTED_TOTAL,
+    HLE_STANDARD_EXPECTED_TEXT_ONLY,
+    HLE_STANDARD_EXPECTED_TOTAL,
+    HLE_VERIFIED_EXPECTED_COUNT,
+    HLE_VERIFIED_EXPECTED_TOTAL,
     load_hle_dataset,
+    load_hle_standard_rows,
     load_hle_verified_rows,
 )
 
@@ -22,17 +26,21 @@ def test_fixture_is_one_multimodal_sample():
     assert sample.target == "1"
     assert sample.metadata["answer_type"] == "exact_match"
     assert isinstance(sample.input[0], ChatMessageUser)
-    image = next(item for item in sample.input[0].content if isinstance(item, ContentImage))
-    with Image.open(io.BytesIO(base64.b64decode(image.image.split(",", 1)[1]))) as decoded:
+    image = next(
+        item for item in sample.input[0].content if isinstance(item, ContentImage)
+    )
+    with Image.open(
+        io.BytesIO(base64.b64decode(image.image.split(",", 1)[1]))
+    ) as decoded:
         assert decoded.size == (16, 16)
         assert decoded.convert("RGB").getpixel((0, 0)) == (0, 0, 255)
 
 
 def test_verified_schema_selects_gold_rows(monkeypatch, tmp_path):
     rows = []
-    for index in range(HLE_EXPECTED_TOTAL):
+    for index in range(HLE_VERIFIED_EXPECTED_TOTAL):
         verified_class = (
-            "Gold subset" if index < HLE_EXPECTED_COUNT else "Revision subset"
+            "Gold subset" if index < HLE_VERIFIED_EXPECTED_COUNT else "Revision subset"
         )
         payload = {
             "id": f"verified-{index}",
@@ -49,10 +57,35 @@ def test_verified_schema_selects_gold_rows(monkeypatch, tmp_path):
 
     selected = load_hle_verified_rows(tmp_path)
 
-    assert len(selected) == HLE_EXPECTED_COUNT
+    assert len(selected) == HLE_VERIFIED_EXPECTED_COUNT
     assert selected[0]["id"] == "verified-0"
-    assert selected[-1]["id"] == f"verified-{HLE_EXPECTED_COUNT - 1}"
+    assert selected[-1]["id"] == f"verified-{HLE_VERIFIED_EXPECTED_COUNT - 1}"
     assert {row["Verified_Classes"] for row in selected} == {"Gold subset"}
+
+
+def test_standard_schema_selects_exact_text_only_pool(monkeypatch, tmp_path):
+    rows = [
+        {
+            "id": f"standard-{index}",
+            "question": f"question {index}",
+            "answer": str(index),
+            "answer_type": "exactMatch",
+            "image": "" if index < HLE_STANDARD_EXPECTED_TEXT_ONLY else "image-data",
+        }
+        for index in range(HLE_STANDARD_EXPECTED_TOTAL)
+    ]
+    monkeypatch.setattr(dataset_module, "_load_rows", lambda path: rows)
+
+    selected = load_hle_standard_rows(tmp_path)
+
+    assert len(selected) == HLE_STANDARD_EXPECTED_TEXT_ONLY
+    assert all(not row["image"] for row in selected)
+
+
+def test_standard_dataset_requires_immutable_revision(monkeypatch, tmp_path):
+    monkeypatch.delenv("HLE_DATASET_REVISION", raising=False)
+    with pytest.raises(RuntimeError, match="immutable 40-character commit"):
+        load_hle_dataset(tmp_path, dataset_variant="standard")
 
 
 def test_manifest_filters_and_preserves_order(tmp_path):

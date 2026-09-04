@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 import argparse
 import os
+import sys
+import warnings
 from pathlib import Path
+from typing import Callable
 
 KEYS = {
     "openai": ("openai.key", "OPENAI_API_KEY"),
@@ -26,11 +29,54 @@ def _read_key(path: Path, variable: str) -> str:
     return value
 
 
+def _is_inspect_eval(command: list[str]) -> bool:
+    return any(
+        Path(token).name == "inspect" and command[index + 1] == "eval"
+        for index, token in enumerate(command[:-1])
+    )
+
+
+def _smoke_or_stop(
+    command: list[str],
+    *,
+    skip: bool,
+    smoke_runner: Callable[[list[str]], list[str]] | None = None,
+) -> None:
+    if not _is_inspect_eval(command):
+        return
+    if skip:
+        warnings.warn(
+            "HLE smoke test explicitly skipped; evaluation is proceeding without "
+            "tool or endpoint validation.",
+            RuntimeWarning,
+        )
+        return
+    try:
+        if smoke_runner is None:
+            from smoke import run_smoke_test
+
+            smoke_runner = run_smoke_test
+        checks = smoke_runner(command)
+    except Exception as error:
+        detail = str(error) or type(error).__name__
+        warnings.warn(
+            f"HLE smoke test failed; evaluation stopped: {detail}",
+            RuntimeWarning,
+        )
+        raise SystemExit(2) from error
+    print(f"HLE smoke test passed: {', '.join(checks)}", file=sys.stderr)
+
+
 def main() -> None:
+    argv = sys.argv[1:]
+    skip_smoke_test = "--skip-smoke-test" in argv
+    argv = [argument for argument in argv if argument != "--skip-smoke-test"]
     parser = argparse.ArgumentParser()
-    parser.add_argument("--provider", action="append", choices=sorted(KEYS), required=True)
+    parser.add_argument(
+        "--provider", action="append", choices=sorted(KEYS), required=True
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if not args.command:
         parser.error("a command is required")
 
@@ -42,6 +88,8 @@ def main() -> None:
         if not path.is_file():
             raise RuntimeError(f"authorized key file is unavailable: {path}")
         env[variable] = _read_key(path, variable)
+    os.environ.update(env)
+    _smoke_or_stop(args.command, skip=skip_smoke_test)
     os.execvpe(args.command[0], args.command, env)
 
 

@@ -9,9 +9,12 @@ services:
     read_only: true
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=256m
-      - /workspace:rw,nosuid,nodev,size=100m
+      - /var/tmp:rw,nosuid,nodev,exec,size=512m,mode=1777
+      - /workspace:rw,nosuid,nodev,size=100m,mode=1777
     cap_drop:
       - ALL
+    cap_add:
+      - FOWNER
     security_opt:
       - no-new-privileges:true
     pids_limit: 256
@@ -21,3 +24,4 @@ services:
     environment:
       HOME: /tmp
       MPLBACKEND: Agg
+      TMPDIR: /var/tmp
