@@ -26,8 +26,9 @@ Launch HLE evaluations through `run_with_secrets.py`. Before it starts `inspect 
 1. `web_search` uses the configured live backend and returns structured results, and `fetch_url` can retrieve at least one returned page;
 2. `python_session` preserves state across calls in the same sandbox declared by the evaluation task;
 3. the `submit` tool preserves a plain-text HLE response;
-4. the evaluated-model endpoint returns a non-empty response; and
-5. the judge endpoint returns a valid equality judgment for a known canary using GPT-5.6 Luna at medium reasoning effort.
+4. a configured OpenAI-compatible endpoint's `/models` catalog contains the exact served ID (native Google models use the equivalent model lookup);
+5. the evaluated-model endpoint returns a non-empty response with the requested reasoning settings; and
+6. the judge endpoint returns a valid equality judgment for a known canary using GPT-5.6 Luna at medium reasoning effort.
 
 Direct/no-tools HLE skips checks 1–3. A live tools run fails if `HLE_SEARCH_BACKEND` silently resolves to `fixture`. Any failed check emits a warning and exits with status 2 before evaluation samples run.
 
@@ -54,6 +55,24 @@ PYTHONPATH=. uv run --project solvers/hle-tools-v0 --frozen -- \
 ```
 
 The override itself prints a warning. For a non-OpenAI judge endpoint, set `HLE_JUDGE_BASE_URL`; the evaluated model continues to use Inspect's normal `--model-base-url` option. Task and model config files and `-T`/`-M` arguments are reused by the smoke test.
+
+For an arbitrary OpenAI-compatible or vLLM model, provide all endpoint behavior explicitly:
+
+```bash
+VLLM_API_KEY="$SERVED_MODEL_API_KEY" PYTHONPATH=. \
+python solvers/hle-tools-v0/run_with_secrets.py --provider openai \
+  inspect eval agent_baselines/evals/hle_verified_direct/task.py@hle_verified_direct \
+  --model vllm/exact-served-model-id \
+  --model-base-url https://model-host.example/v1 \
+  --reasoning-history all \
+  --timeout 660 --attempt-timeout 600 --no-fail-on-error --log-buffer 1
+```
+
+`VLLM_API_KEY` must be set to the real key or an explicit dummy token; relying on Inspect's implicit vLLM default is not allowed for these runs. The wrapper refuses endpoint launches without explicit `--reasoning-history`, and the required smoke checks both `/models` and tiny inference before samples begin. Never place a secret value in a command, config, or log; inject the variable from the runtime secret file.
+
+Native `google/gemini-3.8-flash` is supported with `--reasoning-effort high` and no temperature override. Inspect's Google adapter maps high effort to native high thinking; omitting temperature also avoids the legacy `temperature`, `top_p`, and `top_k` fields rejected by Gemini 3.8.
+
+Use one Inspect process per model × condition. Inspect's sample IDs are the deterministic resume keys; `--log-buffer 1` persists each sample immediately, `--no-fail-on-error` continues after bounded sample errors, and `inspect eval-retry <eval-log>` retries failed samples while preserving completed ones. Reports must retain errored samples in the manifest denominator and distinguish an accounted run from an all-scored run.
 
 ## Offline checks
 

@@ -1,5 +1,7 @@
 import asyncio
 import importlib.util
+import io
+import json
 import sys
 from pathlib import Path
 
@@ -32,6 +34,10 @@ def test_parse_eval_launch_recovers_endpoints_and_task_configuration(tmp_path):
             "--model",
             "vllm/checkpoint",
             "--model-base-url=http://model.example/v1",
+            "--reasoning-history",
+            "all",
+            "--reasoning-effort",
+            "high",
             "--model-config",
             str(model_config),
             "-T",
@@ -44,9 +50,50 @@ def test_parse_eval_launch_recovers_endpoints_and_task_configuration(tmp_path):
     assert launch.model == "vllm/checkpoint"
     assert launch.model_base_url == "http://model.example/v1"
     assert launch.model_args == {"extra_body": {"provider": "test"}}
+    assert launch.reasoning_history == "all"
+    assert launch.reasoning_effort == "high"
     assert launch.judge_model == "openai/gpt-5.6-luna"
     assert launch.uses_tools is True
     assert launch.fixture is True
+
+
+def test_endpoint_requires_explicit_reasoning_history():
+    with pytest.raises(smoke.SmokeTestError, match="reasoning-history"):
+        smoke.parse_eval_launch(
+            [
+                "inspect",
+                "eval",
+                "agent_baselines/evals/hle_direct/task.py@hle_direct",
+                "--model",
+                "vllm/served-id",
+                "--model-base-url",
+                "http://model.example/v1",
+            ]
+        )
+
+
+def test_endpoint_catalog_requires_explicit_token_and_exact_model(monkeypatch):
+    launch = smoke.parse_eval_launch(
+        [
+            "inspect",
+            "eval",
+            "agent_baselines/evals/hle_direct/task.py@hle_direct",
+            "--model",
+            "vllm/served-id",
+            "--model-base-url",
+            "http://model.example/v1",
+            "--reasoning-history",
+            "all",
+        ]
+    )
+    monkeypatch.delenv("VLLM_API_KEY", raising=False)
+    with pytest.raises(smoke.SmokeTestError, match="explicit VLLM_API_KEY"):
+        smoke._probe_model_catalog(launch)
+
+    monkeypatch.setenv("VLLM_API_KEY", "dummy-token")
+    response = io.BytesIO(json.dumps({"data": [{"id": "served-id"}]}).encode())
+    monkeypatch.setattr(smoke.urllib.request, "urlopen", lambda *args, **kwargs: response)
+    assert smoke._probe_model_catalog(launch) is True
 
 
 def test_live_tools_eval_rejects_fixture_search_backend(monkeypatch):

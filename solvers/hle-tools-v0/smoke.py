@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import tempfile
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -41,6 +44,8 @@ class EvalLaunch:
     model: str
     model_base_url: str | None
     model_args: dict[str, Any]
+    reasoning_effort: str | None
+    reasoning_history: str | None
     judge_model: str
     uses_tools: bool
     fixture: bool
@@ -116,16 +121,75 @@ def parse_eval_launch(command: list[str]) -> EvalLaunch:
     )
     judge_model = str(task_args.get("judge_model", DEFAULT_JUDGE_MODEL))
     task_name = task_spec.rsplit("@", 1)[-1]
+    model_base_url = _single_option(command, "--model-base-url")
+    reasoning_history = _single_option(command, "--reasoning-history")
+    if model_base_url and not reasoning_history:
+        raise SmokeTestError(
+            "endpoint evaluations must specify --reasoning-history explicitly"
+        )
     return EvalLaunch(
         task_spec=task_spec,
         task_args=task_args,
         model=model,
-        model_base_url=_single_option(command, "--model-base-url"),
+        model_base_url=model_base_url,
         model_args=model_args,
+        reasoning_effort=_single_option(command, "--reasoning-effort"),
+        reasoning_history=reasoning_history,
         judge_model=judge_model,
         uses_tools="hle_tools" in task_name,
         fixture=bool(task_args.get("fixture", False)),
     )
+
+
+def _probe_model_catalog(launch: EvalLaunch) -> bool:
+    provider, _, model_id = launch.model.partition("/")
+    if not model_id:
+        raise SmokeTestError("Inspect model must include an explicit provider/model ID")
+    if launch.model_base_url:
+        if provider == "vllm":
+            key = os.environ.get("VLLM_API_KEY", "").strip()
+            variable = "VLLM_API_KEY"
+        elif provider == "openai":
+            key = os.environ.get("OPENAI_API_KEY", "").strip()
+            variable = "OPENAI_API_KEY"
+        else:
+            raise SmokeTestError(
+                f"model catalog canary does not support {provider!r} with --model-base-url"
+            )
+        if not key:
+            raise SmokeTestError(
+                f"endpoint evaluation requires explicit {variable} (real key or dummy token)"
+            )
+        url = f"{launch.model_base_url.rstrip('/')}/models"
+        headers = {"Authorization": f"Bearer {key}"}
+    elif provider == "google":
+        key = os.environ.get("GOOGLE_API_KEY", "").strip()
+        if not key:
+            raise SmokeTestError("Google model catalog requires GOOGLE_API_KEY")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}"
+        headers = {"x-goog-api-key": key}
+    else:
+        return False
+
+    try:
+        request = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(request, timeout=30) as response:
+            data = json.load(response)
+    except (urllib.error.URLError, TimeoutError, ValueError) as error:
+        raise SmokeTestError(
+            f"model catalog canary failed for {launch.model}: {type(error).__name__}"
+        ) from error
+
+    if launch.model_base_url:
+        ids = {item.get("id") for item in data.get("data", [])}
+        available = model_id in ids
+    else:
+        available = str(data.get("name", "")).removeprefix("models/") == model_id
+    if not available:
+        raise SmokeTestError(
+            f"exact model {model_id!r} is absent from the provider model catalog"
+        )
+    return True
 
 
 async def _probe_model_endpoint(launch: EvalLaunch) -> None:
@@ -142,6 +206,8 @@ async def _probe_model_endpoint(launch: EvalLaunch) -> None:
                 max_retries=0,
                 timeout=120,
                 attempt_timeout=120,
+                reasoning_effort=launch.reasoning_effort,
+                reasoning_history=launch.reasoning_history,
             ),
         )
     except Exception as error:
@@ -282,6 +348,8 @@ def run_smoke_test(command: list[str]) -> list[str]:
         asyncio.run(_probe_web_tools(fixture=launch.fixture))
         _probe_sandbox_tools(launch)
         checks.extend(["web_search", "fetch_url", "python_session", "submit"])
+    if _probe_model_catalog(launch):
+        checks.append("model_catalog")
     asyncio.run(_probe_model_endpoint(launch))
     asyncio.run(_probe_judge_endpoint(launch))
     checks.extend(["model_endpoint", "judge_endpoint"])
