@@ -218,6 +218,12 @@ async def _probe_model_endpoint(launch: EvalLaunch) -> None:
         raise SmokeTestError(
             f"evaluated-model endpoint returned an empty response for {launch.model}"
         )
+    expected_model = launch.model.partition("/")[2]
+    if output.model != expected_model:
+        raise SmokeTestError(
+            f"evaluated-model endpoint returned model {output.model!r}, "
+            f"expected exact ID {expected_model!r}"
+        )
 
 
 async def _probe_judge_endpoint(launch: EvalLaunch) -> None:

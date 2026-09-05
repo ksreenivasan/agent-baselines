@@ -4,6 +4,7 @@ import io
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -94,6 +95,30 @@ def test_endpoint_catalog_requires_explicit_token_and_exact_model(monkeypatch):
     response = io.BytesIO(json.dumps({"data": [{"id": "served-id"}]}).encode())
     monkeypatch.setattr(smoke.urllib.request, "urlopen", lambda *args, **kwargs: response)
     assert smoke._probe_model_catalog(launch) is True
+
+
+def test_endpoint_inference_requires_exact_response_model(monkeypatch):
+    launch = smoke.parse_eval_launch(
+        [
+            "inspect",
+            "eval",
+            "agent_baselines/evals/hle_direct/task.py@hle_direct",
+            "--model",
+            "vllm/served-id",
+            "--model-base-url",
+            "http://model.example/v1",
+            "--reasoning-history",
+            "all",
+        ]
+    )
+
+    class Model:
+        async def generate(self, **kwargs):
+            return SimpleNamespace(completion="OK", model="unexpected-alias")
+
+    monkeypatch.setattr(smoke, "get_model", lambda *args, **kwargs: Model())
+    with pytest.raises(smoke.SmokeTestError, match="expected exact ID"):
+        asyncio.run(smoke._probe_model_endpoint(launch))
 
 
 def test_live_tools_eval_rejects_fixture_search_backend(monkeypatch):
