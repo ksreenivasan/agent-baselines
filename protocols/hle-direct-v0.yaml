@@ -4,7 +4,7 @@ comparability: artificial_analysis_hle
 dataset:
   repo: cais/hle
   release: May 2025
-  revision: required_immutable_commit_via_HLE_DATASET_REVISION
+  revision: 021a3d71f516a7ac28ceb8d284969902edf1edeb
   source_count: 2500
   selection: text_only
   evaluation_count: 2158

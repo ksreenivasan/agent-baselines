@@ -83,9 +83,9 @@ PYTHONPATH=. uv run --project solvers/hle-tools-v0 --frozen -- pytest -q tests/h
 
 ## Pinned standard data
 
-Set `HLE_DATA_PATH` to a local snapshot of `cais/hle` and `HLE_DATASET_REVISION` to its immutable 40-character Hugging Face commit. Mutable refs such as `main` are rejected. The loader verifies 2,500 source rows, unique IDs, and exactly 2,158 rows with no image before evaluation.
+Set `HLE_DATA_PATH` to a local snapshot of `cais/hle` and `HLE_DATASET_REVISION` to the immutable May 20, 2025 commit `021a3d71f516a7ac28ceb8d284969902edf1edeb`. Mutable refs such as `main` are rejected. The loader verifies 2,500 source rows, unique IDs, and exactly 2,158 rows with no image before evaluation.
 
-The exact commit for the requested May 2025 snapshot must be recorded after the Hugging Face gate is accepted; do not guess it or silently substitute the current `main` revision.
+The authenticated M2 snapshot is pinned to that exact revision; do not silently substitute the current `main` revision.
 
 The task entry points are:
 
