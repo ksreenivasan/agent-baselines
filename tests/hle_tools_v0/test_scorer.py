@@ -30,7 +30,7 @@ def test_answer_type_selects_canonical_hle_response_prompt():
 def test_parse_judgment():
     parsed = parse_judgment(
         '{"extracted_final_answer":"1","reasoning":"matches",'
-        '"correct":"yes","confidence":75,"strict":true}'
+        '"correct":"yes","confidence":75}'
     )
     assert parsed.extracted_final_answer == "1"
     assert parsed.confidence == 75
@@ -39,9 +39,9 @@ def test_parse_judgment():
 @pytest.mark.parametrize(
     "payload",
     [
-        '{"extracted_final_answer":"1","reasoning":"x","correct":"maybe","confidence":75,"strict":true}',
-        '{"extracted_final_answer":"1","reasoning":"x","correct":"yes","confidence":101,"strict":true}',
-        '{"extracted_final_answer":"1","reasoning":"x","correct":"yes","confidence":75,"strict":true,"extra":true}',
+        '{"extracted_final_answer":"1","reasoning":"x","correct":"maybe","confidence":75}',
+        '{"extracted_final_answer":"1","reasoning":"x","correct":"yes","confidence":101}',
+        '{"extracted_final_answer":"1","reasoning":"x","correct":"yes","confidence":75,"extra":true}',
     ],
 )
 def test_invalid_judgment(payload):

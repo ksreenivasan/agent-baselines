@@ -7,7 +7,7 @@ The default direct evaluation follows the disclosed Artificial Analysis HLE prot
 - Scoring: the complete response is evaluated with the disclosed HLE equality-checker prompt using `openai/gpt-5.6-luna` at medium reasoning effort.
 - Attempts: pass@1, with no tools in the `hle_direct` condition.
 
-The `hle_tools_v0` condition uses the same dataset, response format, and scorer, but adds Exa search, controlled fetch, stateful Python, and a 15-turn agent loop. It is an experimental tools extension and is not directly comparable to Artificial Analysis' no-tools leaderboard.
+The `hle_tools_v0` condition uses the same dataset, response format, and scorer, but adds Keenable search, controlled fetch, stateful Python, and a 15-turn agent loop. It is an experimental tools extension and is not directly comparable to Artificial Analysis' no-tools leaderboard.
 
 `dataset_variant="verified"` remains available. It uses `skylenage-ai/HLE-Verified@0bc83643672d4f68a5f89998617a639d85e7318b`, selecting its 668-row `Gold subset`.
 
@@ -15,9 +15,11 @@ The `hle_tools_v0` condition uses the same dataset, response format, and scorer,
 - Structured JSON is used only for the private equality judge's response.
 - Raw datasets, manifests, and run logs stay under ignored `protected/` paths.
 - `cais/hle` is gated. Accept its terms and authenticate on the machine that downloads it. Do not redistribute benchmark data.
-- Generated Python runs in the no-network Docker sandbox in `sandbox/`.
+- Generated Python runs in an isolated no-network sandbox. Docker Compose in
+  `sandbox/` remains the portable default; M2 Slurm jobs explicitly select the
+  `m2-enroot` backend described below.
 - Model keys are injected at runtime by `run_with_secrets.py`; key values are never printed.
-- Search uses Exa when `~/secrets_and_keys/exa.key` exists. Without it, only fixture search is enabled and live runs are blocked.
+- Search uses Keenable in `pro` mode when `~/secrets_and_keys/keenable.key` is loaded. Exa remains available as an explicit alternative. Without a live-search credential, only fixture search is enabled and live runs are blocked.
 
 ## Required launch smoke test
 
@@ -35,10 +37,10 @@ Direct/no-tools HLE skips checks 1–3. A live tools run fails if `HLE_SEARCH_BA
 Example shape:
 
 ```bash
-export HLE_SEARCH_BACKEND=exa
+export HLE_SEARCH_BACKEND=keenable
 PYTHONPATH=. uv run --project solvers/hle-tools-v0 --frozen -- \
   python solvers/hle-tools-v0/run_with_secrets.py \
-  --provider openai --provider exa \
+  --provider openai --provider keenable \
   inspect eval agent_baselines/evals/hle_tools_v0/task.py@hle_tools_v0 \
   --model openai/gpt-5.6-sol \
   -T data_path="$HLE_DATA_PATH" \
@@ -50,7 +52,7 @@ To proceed deliberately despite a failed or unavailable smoke dependency, add `-
 ```bash
 PYTHONPATH=. uv run --project solvers/hle-tools-v0 --frozen -- \
   python solvers/hle-tools-v0/run_with_secrets.py \
-  --skip-smoke-test --provider openai --provider exa \
+  --skip-smoke-test --provider openai --provider keenable \
   inspect eval agent_baselines/evals/hle_tools_v0/task.py@hle_tools_v0 ...
 ```
 
@@ -65,14 +67,30 @@ python solvers/hle-tools-v0/run_with_secrets.py --provider openai \
   --model vllm/exact-served-model-id \
   --model-base-url https://model-host.example/v1 \
   --reasoning-history all \
-  --timeout 660 --attempt-timeout 600 --no-fail-on-error --log-buffer 1
+  --timeout 660 --attempt-timeout 600 --no-fail-on-error \
+  --log-format eval --log-buffer 1
 ```
 
 `VLLM_API_KEY` must be set to the real key or an explicit dummy token; relying on Inspect's implicit vLLM default is not allowed for these runs. The wrapper refuses endpoint launches without explicit `--reasoning-history`, and the required smoke checks both `/models` and tiny inference before samples begin. Never place a secret value in a command, config, or log; inject the variable from the runtime secret file.
 
 Native `google/gemini-3.8-flash` is supported with `--reasoning-effort high` and no temperature override. Inspect's Google adapter maps high effort to native high thinking; omitting temperature also avoids the legacy `temperature`, `top_p`, and `top_k` fields rejected by Gemini 3.8.
 
-Use one Inspect process per model × condition. Inspect's sample IDs are the deterministic resume keys; `--log-buffer 1` persists each sample immediately, `--no-fail-on-error` continues after bounded sample errors, and `inspect eval-retry <eval-log>` retries failed samples while preserving completed ones. Reports must retain errored samples in the manifest denominator and distinguish an accounted run from an all-scored run.
+Use one Inspect process per model x condition. Always use `--log-format eval`; the
+JSON recorder retains every complete sample in memory and rewrites the complete
+JSON document at every flush. The `.eval` recorder moves completed samples into
+a ZIP-backed temporary file and clears its full-sample buffer after each flush.
+`--log-buffer 1` therefore bounds full-sample memory while preserving each sample
+as it completes.
+
+On M2, write the live `.eval` log to per-job storage under `/var/tmp`, not directly
+to Weka. Run `m2/checkpoint_eval_logs.py` alongside Inspect to copy only validated
+ZIP snapshots to Weka through a temporary file plus atomic rename. A concurrent or
+failed copy can never replace the last valid checkpoint. Stop the helper with
+`SIGTERM` after Inspect exits; it performs one final checkpoint before stopping.
+Resume an interrupted checkpoint with `inspect eval-retry <checkpoint.eval>`.
+`--no-fail-on-error` continues after bounded sample errors. Reports must retain
+errored samples in the manifest denominator and distinguish an accounted run from
+an all-scored run.
 
 ## Offline checks
 
@@ -95,6 +113,33 @@ agent_baselines/evals/hle_tools_v0/task.py@hle_tools_v0
 ```
 
 Both default to `dataset_variant="standard"`. Pass `dataset_variant="verified"` to either task, or use the compatibility wrapper `agent_baselines/evals/hle_verified_direct/task.py@hle_verified_direct`, for HLE-Verified.
+
+## M2 Enroot sandbox
+
+M2 users cannot access the Docker daemon from Slurm jobs. Source the preparation
+helper inside the allocation, then select the M2 backend on the task:
+
+```bash
+source solvers/hle-tools-v0/m2/prepare-enroot.sh
+trap cleanup_m2_enroot EXIT
+
+PYTHONPATH=. uv run --project solvers/hle-tools-v0 --frozen -- \
+  python solvers/hle-tools-v0/run_with_secrets.py \
+  --provider openai --provider keenable \
+  inspect eval agent_baselines/evals/hle_tools_v0/task.py@hle_tools_v0 \
+  --model openai/gpt-5.6-sol \
+  -T sandbox_backend=m2-enroot \
+  -T data_path="$HLE_DATA_PATH" \
+  -T dataset_revision="$HLE_DATASET_REVISION"
+```
+
+The helper builds a per-job Enroot container under `/var/tmp`; no container
+state is placed on Weka. The custom Inspect backend gives every sample its own
+workspace and persistent Python namespace, removes provider/search credentials,
+blocks network access, and masks `/home` and `/mnt/weka`. Run
+`python solvers/hle-tools-v0/m2/selftest.py` after preparation to verify those
+properties. Cleanup removes the per-job container; `/var/tmp` may be reclaimed
+by the node without affecting evaluation artifacts.
 
 ## HLE-Verified data and manifests
 

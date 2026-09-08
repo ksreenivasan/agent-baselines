@@ -81,6 +81,42 @@ async def _exa_search(query: str, max_results: int) -> list[dict[str, str | int]
     return results
 
 
+async def _keenable_search(
+    query: str, max_results: int
+) -> list[dict[str, str | int]]:
+    key = os.environ.get("KEENABLE_API_KEY")
+    if not key:
+        raise RuntimeError("KEENABLE_API_KEY is unavailable; live search is blocked")
+    async with httpx.AsyncClient(timeout=30) as client:
+        for attempt in range(2):
+            response = await client.post(
+                "https://api.keenable.ai/v1/search",
+                headers={"X-API-Key": key},
+                json={"query": query, "max_results": max_results, "mode": "pro"},
+            )
+            if response.status_code != 429 or attempt == 1:
+                break
+            await asyncio.sleep(2)
+        response.raise_for_status()
+    results = []
+    for rank, item in enumerate(response.json().get("results", []), start=1):
+        url = str(item.get("url", ""))
+        if not _public_http_url(url) or _blocked_hle_url(url):
+            continue
+        results.append(
+            {
+                "rank": rank,
+                "title": str(item.get("title", "")),
+                "url": url,
+                "snippet": str(
+                    item.get("snippet") or item.get("description", "")
+                )[:2000],
+                "backend": "keenable",
+            }
+        )
+    return results
+
+
 @tool
 def web_search() -> Tool:
     async def execute(query: str, max_results: int = 5):
@@ -113,6 +149,18 @@ def web_search() -> Tool:
                 return {"backend": "exa", "error": f"search_http_{error.response.status_code}"}
             except httpx.HTTPError:
                 return {"backend": "exa", "error": "search_transport_error"}
+        elif backend == "keenable":
+            try:
+                results = await _keenable_search(query, max_results)
+            except httpx.TimeoutException:
+                return {"backend": "keenable", "error": "search_timeout"}
+            except httpx.HTTPStatusError as error:
+                return {
+                    "backend": "keenable",
+                    "error": f"search_http_{error.response.status_code}",
+                }
+            except httpx.HTTPError:
+                return {"backend": "keenable", "error": "search_transport_error"}
         else:
             return {"backend": backend, "error": "unsupported_search_backend"}
         _urls().update(str(result["url"]) for result in results)

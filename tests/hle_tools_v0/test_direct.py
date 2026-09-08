@@ -30,7 +30,7 @@ def test_direct_condition_is_one_tool_free_multimodal_generation():
             model="mockllm/judge",
             content=(
                 '{"extracted_final_answer":"1","reasoning":"matches",'
-                '"correct":"yes","confidence":90,"strict":true}'
+                '"correct":"yes","confidence":90}'
             ),
         )
 

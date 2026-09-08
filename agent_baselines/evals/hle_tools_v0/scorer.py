@@ -28,7 +28,6 @@ class EqualityJudgment(BaseModel):
     reasoning: str
     correct: Literal["yes", "no"]
     confidence: int = Field(ge=0, le=100)
-    strict: Literal[True]
 
 
 def parse_judgment(text: str) -> EqualityJudgment:

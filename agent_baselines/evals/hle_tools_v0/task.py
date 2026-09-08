@@ -12,6 +12,17 @@ _SANDBOX = (
 )
 
 
+def _sandbox(backend: str):
+    if backend == "docker":
+        return ("docker", str(_SANDBOX))
+    if backend == "m2-enroot":
+        # Importing the module registers the M2-specific Inspect sandbox.
+        from agent_baselines.evals.hle_tools_v0 import m2_enroot_sandbox  # noqa: F401
+
+        return "m2-enroot"
+    raise ValueError("sandbox_backend must be one of: docker, m2-enroot")
+
+
 @task
 def hle_tools_v0(
     fixture: bool = False,
@@ -22,6 +33,7 @@ def hle_tools_v0(
     dataset_revision: str | None = None,
     judge_model: str | Model = DEFAULT_JUDGE_MODEL,
     judge_reasoning_effort: str = "medium",
+    sandbox_backend: str = "docker",
 ) -> Task:
     return Task(
         dataset=load_hle_dataset(
@@ -37,7 +49,7 @@ def hle_tools_v0(
             judge_model=judge_model,
             judge_reasoning_effort=judge_reasoning_effort,
         ),
-        sandbox=("docker", str(_SANDBOX)),
+        sandbox=_sandbox(sandbox_backend),
         time_limit=1800,
         message_limit=80,
     )

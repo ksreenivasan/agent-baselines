@@ -1,5 +1,5 @@
 protocol: hle-tools-v0
-protocol_revision: 2026-09-04-aa-hle-prompt-and-judge
+protocol_revision: 2026-09-05-keenable-search-backend
 dataset:
   default_variant: standard
   repo: cais/hle
@@ -40,9 +40,13 @@ agent:
   final_turn: submit_only
   tools: [web_search, fetch_url, python_session]
 search:
-  preferred_backend: exa
+  preferred_backend: keenable
+  mode: pro
   scientific_search: false
 sandbox:
+  portable_default: docker
+  m2_slurm: m2-enroot
+  m2_ephemeral_root: /var/tmp
   network: none
   privileged: false
   docker_socket: false

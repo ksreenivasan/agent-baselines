@@ -1,11 +1,29 @@
 import argparse
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
 from agent_baselines.evals.hle_tools_v0.dataset import load_hle_dataset
 from agent_baselines.evals.hle_tools_v0.manifest import build_manifests
+
+
+def _docker_available() -> bool:
+    if not shutil.which("docker"):
+        return False
+    try:
+        return (
+            subprocess.run(
+                ["docker", "version"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            ).returncode
+            == 0
+        )
+    except subprocess.TimeoutExpired:
+        return False
 
 
 def preflight() -> int:
@@ -15,10 +33,16 @@ def preflight() -> int:
     hle_verified_path = os.environ.get("HLE_VERIFIED_DATA_PATH")
     checks = {
         "fixture_rows": len(load_hle_dataset(fixture=True)),
-        "docker_available": subprocess.run(
-            ["docker", "version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        ).returncode
-        == 0,
+        "docker_available": _docker_available(),
+        "m2_enroot_available": bool(shutil.which("enroot") and shutil.which("unshare")),
+        "m2_enroot_container_ready": bool(
+            os.environ.get("M2_ENROOT_CONTAINER")
+            and os.environ.get("ENROOT_DATA_PATH")
+            and (
+                Path(os.environ["ENROOT_DATA_PATH"])
+                / os.environ["M2_ENROOT_CONTAINER"]
+            ).is_dir()
+        ),
         "hle_standard_data_available": bool(
             hle_path and Path(hle_path).expanduser().exists()
         ),
@@ -31,6 +55,7 @@ def preflight() -> int:
             hle_verified_path and Path(hle_verified_path).expanduser().exists()
         ),
         "exa_key_available": (key_dir / "exa.key").is_file(),
+        "keenable_key_available": (key_dir / "keenable.key").is_file(),
         "tavily_key_available": (key_dir / "tavily.key").is_file(),
         "provider_key_files": {
             name: (key_dir / filename).is_file()
@@ -51,8 +76,10 @@ def preflight() -> int:
             "standard HLE snapshot revision is not pinned": not checks[
                 "hle_standard_revision_pinned"
             ],
-            "Exa/Tavily credential is unavailable": not (
-                checks["exa_key_available"] or checks["tavily_key_available"]
+            "live search credential is unavailable": not (
+                checks["exa_key_available"]
+                or checks["keenable_key_available"]
+                or checks["tavily_key_available"]
             ),
         }.items()
         if blocked

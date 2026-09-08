@@ -127,6 +127,11 @@ def test_live_tools_eval_rejects_fixture_search_backend(monkeypatch):
         asyncio.run(smoke._probe_web_tools(fixture=False))
 
 
+def test_keenable_secret_provider_mapping():
+    runner = _load_runner()
+    assert runner.KEYS["keenable"] == ("keenable.key", "KEENABLE_API_KEY")
+
+
 def test_fixture_web_search_and_fetch_smoke(monkeypatch):
     monkeypatch.setenv("HLE_SEARCH_BACKEND", "fixture")
     asyncio.run(smoke._probe_web_tools(fixture=True))

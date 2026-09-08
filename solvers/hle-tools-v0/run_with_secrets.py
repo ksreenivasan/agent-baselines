@@ -12,6 +12,7 @@ KEYS = {
     "google": ("gemini.key", "GOOGLE_API_KEY"),
     "openrouter": ("openrouter.key", "OPENROUTER_API_KEY"),
     "exa": ("exa.key", "EXA_API_KEY"),
+    "keenable": ("keenable.key", "KEENABLE_API_KEY"),
 }
 
 

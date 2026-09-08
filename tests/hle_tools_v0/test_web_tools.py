@@ -38,6 +38,30 @@ def test_search_timeout_is_returned_to_model(monkeypatch):
     assert result == {"backend": "exa", "error": "search_timeout"}
 
 
+def test_keenable_search_is_selectable(monkeypatch):
+    async def search(query, max_results):
+        assert query == "safe synthetic query"
+        assert max_results == 3
+        return [
+            {
+                "rank": 1,
+                "title": "Synthetic result",
+                "url": "https://example.com/result",
+                "snippet": "Synthetic snippet",
+                "backend": "keenable",
+            }
+        ]
+
+    monkeypatch.setenv("HLE_SEARCH_BACKEND", "keenable")
+    monkeypatch.setattr(module, "_keenable_search", search)
+    reset_web_state()
+    result = asyncio.run(
+        web_search()(query="safe synthetic query", max_results=3)
+    )
+    assert result[0]["backend"] == "keenable"
+    assert result[0]["url"] in module._urls()
+
+
 def test_fetch_timeout_is_returned_to_model(monkeypatch):
     class TimeoutStream:
         async def __aenter__(self):
