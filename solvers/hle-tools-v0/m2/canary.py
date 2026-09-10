@@ -7,6 +7,8 @@ import re
 from inspect_ai import Task, task
 from inspect_ai.model import ChatMessageAssistant, ChatMessageTool
 from inspect_ai.dataset import Sample
+from inspect_ai.event import ToolEvent
+from inspect_ai.log import transcript
 from inspect_ai.scorer import CORRECT, INCORRECT, Score, accuracy, scorer
 from inspect_ai.solver import TaskState
 from inspect_ai.scorer import Target
@@ -23,7 +25,51 @@ def _matches_code(code: str, expected: str) -> bool:
         return False
 
 
-def check_trajectory(messages, completion: str, invalidated: bool) -> tuple[bool, str]:
+def _literal_payload(text):
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return ast.literal_eval(text)
+
+
+def _tool_payload(reply, call, events):
+    try:
+        return _literal_payload(reply.text)
+    except (ValueError, SyntaxError):
+        pass
+    event = next(
+        (
+            event
+            for event in events
+            if isinstance(event, ToolEvent)
+            and event.id == call.id
+            and event.function == call.function
+            and event.message_id in {None, reply.id}
+        ),
+        None,
+    )
+    if event is None or event.error or event.failed:
+        raise ValueError("no matching successful tool event")
+    if not isinstance(event.result, str):
+        return event.result
+    raw = event.result
+    prefix = (
+        f"\nThe output of your call to {call.function} was too long to be displayed.\n"
+        "Here is a truncated version:\n<START_TOOL_OUTPUT>\n"
+    )
+    suffix = "\n<END_TOOL_OUTPUT>\n"
+    if raw.startswith(prefix):
+        if not event.truncated or not raw.endswith(suffix):
+            raise ValueError("unverified truncation wrapper")
+        # Inspect truncates both the message and ToolEvent. Validate only the
+        # retained literal; never infer syntax or claim the full body survived.
+        raw = raw[len(prefix) : -len(suffix)]
+    return _literal_payload(raw)
+
+
+def check_trajectory(
+    messages, completion: str, invalidated: bool, events=()
+) -> tuple[bool, str]:
     """Require successful replies between each model-generated canary step."""
     if invalidated:
         return False, "Search infrastructure invalidated the sample"
@@ -57,13 +103,9 @@ def check_trajectory(messages, completion: str, invalidated: bool) -> tuple[bool
                 return False, f"{call.function} returned a tool execution error"
             if step in {0, 1}:
                 try:
-                    payload = json.loads(reply.text)
-                except json.JSONDecodeError:
-                    # Inspect 0.3.203 renders native dict/list tool results with repr.
-                    try:
-                        payload = ast.literal_eval(reply.text)
-                    except (ValueError, SyntaxError):
-                        return False, f"{call.function} returned an invalid payload"
+                    payload = _tool_payload(reply, call, events)
+                except (ValueError, SyntaxError):
+                    return False, f"{call.function} returned an invalid payload"
                 if step == 0:
                     if not isinstance(payload, list) or not payload:
                         return False, "Search returned no usable results"
@@ -120,6 +162,7 @@ def trajectory():
             state.messages,
             state.output.completion,
             bool(state.metadata.get("hle_tools_invalidated")),
+            events=transcript().events,
         )
         return Score(value=CORRECT if valid else INCORRECT, explanation=explanation)
 

@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 
 import pytest
+from inspect_ai.event import ToolEvent
+from inspect_ai.model._call_tools import truncate_tool_output
 from inspect_ai.model import ChatMessageAssistant, ChatMessageTool
 from inspect_ai.tool import ToolCall, ToolCallError
 
@@ -149,3 +151,73 @@ def test_canary_requires_native_submit_instead_of_describing_it(monkeypatch):
     )
     assert "one string argument named submission" in prompt
     assert "JSON list describing submit does not complete this check" in prompt
+
+
+def truncated_fetch(items, *, status=200, url="https://docs.python.org/"):
+    raw = repr(
+        {
+            "url": url,
+            "status": status,
+            "text": "documentation " * 1800,
+            "truncated": True,
+        }
+    )
+    shortened = truncate_tool_output("fetch_url", raw, 20000)
+    items[3].content = shortened.output
+    call = items[2].tool_calls[0]
+    return ToolEvent(
+        id=call.id,
+        function="fetch_url",
+        arguments=call.arguments,
+        result=shortened.output,
+        truncated=(shortened.raw_bytes, shortened.truncated_bytes),
+        message_id=items[3].id,
+    )
+
+
+@pytest.mark.parametrize("lane", ["gpt-sol", "gemini-flash", "glm-flash"])
+def test_native_truncated_fetch_is_verified_from_matching_event(lane):
+    items = messages()
+    event = truncated_fetch(items)
+    assert "<START_TOOL_OUTPUT>" in items[3].text
+    assert not canary.check_trajectory(items, ANSWER, False)[0]
+    assert canary.check_trajectory(items, ANSWER, False, [event])[0]
+
+
+@pytest.mark.parametrize(
+    "change", ["missing", "wrong_id", "wrong_message", "no_truncation", "error"]
+)
+def test_truncated_fetch_requires_authenticated_event(change):
+    items = messages()
+    event = truncated_fetch(items)
+    if change == "missing":
+        events = []
+    else:
+        events = [event]
+        if change == "wrong_id":
+            event.id = "another-call"
+        elif change == "wrong_message":
+            event.message_id = "another-message"
+        elif change == "no_truncation":
+            event.truncated = None
+        elif change == "error":
+            event.error = ToolCallError("unknown", "failed")
+    assert not canary.check_trajectory(items, ANSWER, False, events)[0]
+
+
+@pytest.mark.parametrize(
+    "status,url",
+    [(404, "https://docs.python.org/"), (200, "https://unsearched.example/")],
+)
+def test_truncation_does_not_relax_fetch_success_or_url_membership(status, url):
+    items = messages()
+    event = truncated_fetch(items, status=status, url=url)
+    assert not canary.check_trajectory(items, ANSWER, False, [event])[0]
+
+
+def test_corrupt_retained_literal_is_not_reconstructed():
+    items = messages()
+    event = truncated_fetch(items)
+    event.result = event.result.replace("'status': 200", "'status': [")
+    items[3].content = event.result
+    assert not canary.check_trajectory(items, ANSWER, False, [event])[0]
