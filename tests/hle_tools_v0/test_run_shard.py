@@ -538,3 +538,19 @@ def test_k2_bootstrap_is_explicit_and_other_model_commands_are_unchanged(tmp_pat
         cfg["model"] if value == "vllm/test" else value for value in baseline_args
     ]
     assert command[command.index("eval") :] == expected
+
+
+def test_judge_provider_residual_preserves_good_rows_and_is_continuable(
+    tmp_path, judge_provider_error_row
+):
+    archive = tmp_path / "judge-provider.eval"
+    write_archive(archive, samples=[scored_row(), judge_provider_error_row()])
+    result = runner.validate_archive(archive, ["a", "b"])
+    assert not result["valid"] and result["continuable"]
+    assert result["residual"] == [
+        {
+            "id": "b",
+            "disposition": "judge_only",
+            "reason": "judge_provider_infrastructure_error",
+        }
+    ]

@@ -518,7 +518,11 @@ def aggregate(
                     entry["kind"] == "production"
                     and explicit is None
                     and reason
-                    in {"provider_infrastructure_error", "malformed_judge_result"},
+                    in {
+                        "provider_infrastructure_error",
+                        "malformed_judge_result",
+                        "judge_provider_infrastructure_error",
+                    },
                     f"unaccepted outcome {sample_id}: {reason}",
                 )
                 rejected_attempts.append(

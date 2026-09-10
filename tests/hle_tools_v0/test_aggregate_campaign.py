@@ -530,3 +530,13 @@ def test_expected_manifest_must_match_frozen_integrity_record(campaign):
     save(campaign.manifest, manifest)
     with pytest.raises(ValueError, match="frozen dataset integrity"):
         aggregate(campaign)
+
+
+def test_unrepaired_judge_provider_error_is_recorded_without_accepting_a_score(
+    campaign, judge_provider_error_row
+):
+    failed = judge_provider_error_row()
+    campaign.attempt("judge-provider", [row("a", campaign.config, "I"), failed])
+    with pytest.raises(ValueError, match="missing"):
+        aggregate(campaign)
+    assert not (campaign.output / "summary.json").exists()

@@ -26,7 +26,7 @@ repair_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(repair_module)
 
 
-def source_ledger(tmp_path, completion):
+def source_ledger(tmp_path, completion, provider_error=None):
     log = eval(
         Task(
             dataset=[Sample(id="saved-id", input="question", target="42")],
@@ -47,6 +47,12 @@ def source_ledger(tmp_path, completion):
     sample.events.append(
         InfoEvent(source="original_judge_attempt", data="original malformed")
     )
+    if provider_error is not None:
+        from inspect_ai.log import EvalSample
+
+        native_error = EvalSample.model_validate(provider_error)
+        sample.error = native_error.error
+        sample.events.extend(native_error.events)
     log.status = "started"
     log.results = log.reductions = None
     log.eval.scorers[0].name = "hle_scorer"
@@ -166,3 +172,28 @@ def test_source_checksum_mismatch_stops_before_judge_call(tmp_path, monkeypatch)
     with pytest.raises(ValueError, match="checksum"):
         repair_module.repair(ledger, tmp_path / "repair")
     assert calls == []
+
+
+@pytest.mark.parametrize("completion", ["saved full answer", ""])
+def test_provider_failure_repairs_only_judge_and_preserves_native_error_events(
+    tmp_path, monkeypatch, judge_provider_error_row, completion
+):
+    ledger, original = source_ledger(
+        tmp_path, completion, judge_provider_error_row(completion=completion)
+    )
+    before_hash = generation_digest(original.model_dump(mode="json", exclude_none=True))
+    calls = mock_judge(monkeypatch, [VALID])
+    result = repair_module.repair(ledger, tmp_path / "repair")
+    assert result["complete"] and len(calls) == 1
+    restored = read_eval_log(result["archive"], resolve_attachments=True).samples[0]
+    assert repair_module.stable_digest(restored) == repair_module.stable_digest(
+        original
+    )
+    assert (
+        generation_digest(restored.model_dump(mode="json", exclude_none=True))
+        == before_hash
+    )
+    assert restored.output.completion == completion
+    assert any(
+        e.event == "model" and getattr(e, "error", None) for e in restored.events
+    )

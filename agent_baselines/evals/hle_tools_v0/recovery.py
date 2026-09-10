@@ -9,6 +9,7 @@ import ast
 import copy
 import hashlib
 import json
+import re
 from collections import Counter
 from collections.abc import Iterable, Iterator
 from pathlib import Path
@@ -138,6 +139,40 @@ def infrastructure_reasons(sample: dict[str, Any]) -> list[str]:
     return sorted(set(reasons))
 
 
+def _failed_hle_judge_request(sample: dict[str, Any], traceback: str) -> bool:
+    """Require native request-stage evidence before preserving a failed judge."""
+    if not re.search(
+        r'File "[^"\n]*/agent_baselines/evals/hle_tools_v0/scorer\.py", '
+        r"line \d+, in score\n\s+output = await judge\.generate\(",
+        traceback,
+    ):
+        return False
+    events = sample.get("events", [])
+    models = [event for event in events if event.get("event") == "model"]
+    if not models or not models[-1].get("error"):
+        return False
+    starts = [event for event in events if event.get("event") == "span_begin"]
+    spans = {event.get("id"): event for event in starts}
+    if None in spans or len(spans) != len(starts):
+        return False
+    span_id = models[-1].get("span_id")
+    visited = set()
+    hle_scorer = False
+    while span_id and span_id not in visited:
+        visited.add(span_id)
+        span = spans.get(span_id)
+        if span is None:
+            return False
+        if span.get("type") == "scorer":
+            if str(span.get("name", "")).split("/")[-1] != "hle_scorer":
+                return False
+            hle_scorer = True
+        if span.get("type") == "scorers":
+            return hle_scorer
+        span_id = span.get("parent_id")
+    return False
+
+
 def disposition(sample: dict[str, Any]) -> tuple[str, str]:
     bad = infrastructure_reasons(sample)
     if bad:
@@ -153,6 +188,8 @@ def disposition(sample: dict[str, Any]) -> tuple[str, str]:
         if any(
             x in text for x in ("ServerError", "AttemptTimeoutError", "RateLimitError")
         ):
+            if _failed_hle_judge_request(sample, traceback):
+                return "judge_only", "judge_provider_infrastructure_error"
             return "generate", "provider_infrastructure_error"
         return "terminal_error", "unclassified_model_or_execution_error"
     scores = sample.get("scores")

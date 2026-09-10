@@ -305,3 +305,15 @@ expected ID. The new output directory contains `summary.json`, ordered
 native archives and their selected IDs. Token totals, tool counts, and available
 sample elapsed times are recorded without merging long traces into another JSON
 log. Failed validation publishes no completed aggregate.
+
+
+Judge-provider failures are eligible for judge-only repair only when the native
+failed model request belongs to the HLE scorer span and its traceback points to
+the canonical HLE judge invocation. Empty saved solver responses are preserved.
+A nonempty response alone does not establish that generation completed. Missing
+or ambiguous stage evidence keeps the existing disposition and requires review
+before any residual generation; do not turn every `generate` disposition into
+a retry manifest. Search invalidations and errors combined with scores remain
+rejected. A separately verified recovery revision can classify and repair frozen
+production archives without changing their generation, source, or configuration
+checks. The lane runner does not automatically regenerate these residuals.

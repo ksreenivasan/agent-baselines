@@ -186,7 +186,11 @@ def validate_archive(path: Path, expected: list[str]) -> dict:
             result["residual"] = residual
             result["continuable"] = bool(residual) and all(
                 row["reason"]
-                in {"provider_infrastructure_error", "malformed_judge_result"}
+                in {
+                    "provider_infrastructure_error",
+                    "malformed_judge_result",
+                    "judge_provider_infrastructure_error",
+                }
                 for row in residual
             )
     if expected == ["hle-tools-canary"]:
