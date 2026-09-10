@@ -4,9 +4,10 @@ import io
 import json
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
+from inspect_ai._util.content import ContentReasoning
+from inspect_ai.model import ModelOutput, ModelUsage
 
 SMOKE_DIR = Path(__file__).parents[2] / "solvers" / "hle-tools-v0"
 sys.path.insert(0, str(SMOKE_DIR))
@@ -119,7 +120,7 @@ def test_endpoint_inference_requires_exact_response_model(monkeypatch):
 
     class Model:
         async def generate(self, **kwargs):
-            return SimpleNamespace(completion="OK", model="unexpected-alias")
+            return ModelOutput.from_content("unexpected-alias", "OK")
 
     monkeypatch.setattr(smoke, "get_model", lambda *args, **kwargs: Model())
     with pytest.raises(smoke.SmokeTestError, match="expected exact ID"):
@@ -224,3 +225,143 @@ def test_unknown_module_is_not_accepted_as_inspect_bootstrap():
     command = [sys.executable, "-m", "other_module", "eval"]
     assert not smoke.is_inspect_eval(command)
     assert not _load_runner()._is_inspect_eval(command)
+
+
+def _endpoint_launch():
+    return smoke.parse_eval_launch(
+        [
+            "inspect",
+            "eval",
+            "agent_baselines/evals/hle_direct/task.py@hle_direct",
+            "--model",
+            "vllm/served-id",
+            "--model-base-url",
+            "http://model.example/v1",
+            "--reasoning-history",
+            "all",
+            "--reasoning-effort",
+            "high",
+            "--timeout",
+            "1650",
+            "--attempt-timeout",
+            "1500",
+        ]
+    )
+
+
+def test_endpoint_smoke_has_reasoning_headroom_and_reports_native_usage(
+    monkeypatch, capsys
+):
+    launch = _endpoint_launch()
+    launch.model_args["extra_body"] = {"provider_option": "unchanged"}
+    calls = []
+    resolutions = []
+    output = ModelOutput.from_content("served-id", "OK")
+    output.usage = ModelUsage(input_tokens=20, output_tokens=300, total_tokens=320)
+
+    class Model:
+        async def generate(self, **kwargs):
+            calls.append(kwargs)
+            return output
+
+    def resolve(*args, **kwargs):
+        resolutions.append((args, kwargs))
+        return Model()
+
+    monkeypatch.setattr(smoke, "get_model", resolve)
+    asyncio.run(smoke._probe_model_endpoint(launch))
+
+    assert len(calls) == 1
+    assert calls[0]["input"] == "Endpoint health check. Reply with OK."
+    assert calls[0]["config"].model_dump(exclude_none=True) == {
+        "max_tokens": 4096,
+        "max_retries": 0,
+        "timeout": 120,
+        "attempt_timeout": 120,
+        "reasoning_effort": "high",
+        "reasoning_history": "all",
+    }
+    assert resolutions == [
+        (
+            ("vllm/served-id",),
+            {
+                "base_url": "http://model.example/v1",
+                "memoize": False,
+                "extra_body": {"provider_option": "unchanged"},
+            },
+        )
+    ]
+    assert launch.model_args == {"extra_body": {"provider_option": "unchanged"}}
+    diagnostic = json.loads(capsys.readouterr().out.split(": ", 1)[1])
+    assert diagnostic["max_tokens"] == 4096
+    assert diagnostic["stop_reasons"] == ["stop"]
+    assert diagnostic["usage"] == {
+        "input_tokens": 20,
+        "output_tokens": 300,
+        "total_tokens": 320,
+    }
+
+
+@pytest.mark.parametrize("stop_reason", ["max_tokens", "stop"])
+def test_endpoint_reasoning_only_remains_failure_with_sanitized_diagnostics(
+    monkeypatch, capsys, stop_reason
+):
+    output = ModelOutput.from_content("served-id", "")
+    output.choices[0].message.content = [
+        ContentReasoning(reasoning="PRIVATE REASONING", internal="reasoning_content")
+    ]
+    output.choices[0].stop_reason = stop_reason
+    output.usage = ModelUsage(input_tokens=20, output_tokens=4096, total_tokens=4116)
+    calls = []
+
+    class Model:
+        async def generate(self, **kwargs):
+            calls.append(kwargs)
+            return output
+
+    monkeypatch.setattr(smoke, "get_model", lambda *args, **kwargs: Model())
+    with pytest.raises(smoke.SmokeTestError, match="empty response") as error:
+        asyncio.run(smoke._probe_model_endpoint(_endpoint_launch()))
+
+    assert len(calls) == 1
+    assert stop_reason in str(error.value) and "4096" in str(error.value)
+    captured = capsys.readouterr().out
+    assert "PRIVATE REASONING" not in captured + str(error.value)
+    diagnostic = json.loads(captured.split(": ", 1)[1])
+    assert diagnostic["completion_characters"] == 0
+    assert diagnostic["stop_reasons"] == [stop_reason]
+
+
+def test_endpoint_missing_usage_is_unavailable_not_zero(monkeypatch, capsys):
+    class Model:
+        async def generate(self, **kwargs):
+            return ModelOutput.from_content("served-id", "OK")
+
+    monkeypatch.setattr(smoke, "get_model", lambda *args, **kwargs: Model())
+    asyncio.run(smoke._probe_model_endpoint(_endpoint_launch()))
+    assert json.loads(capsys.readouterr().out.split(": ", 1)[1])["usage"] is None
+
+
+@pytest.mark.parametrize("failure", [TimeoutError, RuntimeError])
+def test_endpoint_smoke_failures_do_not_retry_or_skip(monkeypatch, failure):
+    calls = []
+
+    class Model:
+        async def generate(self, **kwargs):
+            calls.append(kwargs)
+            raise failure("unavailable")
+
+    monkeypatch.setattr(smoke, "get_model", lambda *args, **kwargs: Model())
+    with pytest.raises(smoke.SmokeTestError, match=failure.__name__):
+        asyncio.run(smoke._probe_model_endpoint(_endpoint_launch()))
+    assert len(calls) == 1
+
+
+def test_endpoint_smoke_cancellation_propagates(monkeypatch):
+    class Model:
+        async def generate(self, **kwargs):
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(smoke, "get_model", lambda *args, **kwargs: Model())
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(smoke._probe_model_endpoint(_endpoint_launch()))

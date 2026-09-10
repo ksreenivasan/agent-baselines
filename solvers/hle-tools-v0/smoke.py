@@ -209,7 +209,8 @@ async def _probe_model_endpoint(launch: EvalLaunch) -> None:
         ).generate(
             input="Endpoint health check. Reply with OK.",
             config=GenerateConfig(
-                max_tokens=256,
+                # The cap includes reasoning tokens as well as the final reply.
+                max_tokens=4096,
                 max_retries=0,
                 timeout=120,
                 attempt_timeout=120,
@@ -221,9 +222,23 @@ async def _probe_model_endpoint(launch: EvalLaunch) -> None:
         raise SmokeTestError(
             f"evaluated-model endpoint failed for {launch.model}: {type(error).__name__}"
         ) from error
+    diagnostic = {
+        "model": output.model,
+        "max_tokens": 4096,
+        "completion_characters": len(output.completion),
+        "stop_reasons": [choice.stop_reason for choice in output.choices],
+        "usage": (
+            output.usage.model_dump(mode="json", exclude_none=True)
+            if output.usage is not None
+            else None
+        ),
+    }
+    diagnostic_json = json.dumps(diagnostic, sort_keys=True)
+    print(f"model_endpoint_smoke: {diagnostic_json}", flush=True)
     if not output.completion.strip():
         raise SmokeTestError(
-            f"evaluated-model endpoint returned an empty response for {launch.model}"
+            f"evaluated-model endpoint returned an empty response for {launch.model}; "
+            f"{diagnostic_json}"
         )
     expected_model = launch.model.partition("/")[2]
     if output.model != expected_model:
