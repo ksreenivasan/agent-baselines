@@ -517,3 +517,24 @@ def test_distinct_phase_outputs_cannot_share_node_local_scratch(supervisor, tmp_
         local_roots.append(result(supervisor)["local_root"])
     assert local_roots[0] != local_roots[1]
     assert all(Path(root).exists() for root in local_roots)
+
+
+def test_k2_bootstrap_is_explicit_and_other_model_commands_are_unchanged(tmp_path):
+    cfg = config()
+    baseline = runner.make_command(cfg, tmp_path / "ids.json", tmp_path, tmp_path)
+    assert "-m" not in baseline
+    cfg["model"] = "k2-vllm/IFM/K2-Horizon-375B-A23B"
+    command = runner.make_command(cfg, tmp_path / "ids.json", tmp_path, tmp_path)
+    module_index = command.index("-m")
+    assert command[module_index - 1 : module_index + 3] == [
+        sys.executable,
+        "-m",
+        "agent_baselines.evals.hle_tools_v0.k2_vllm_cli",
+        "eval",
+    ]
+    # The provider prefix is the sole change to the actual Inspect arguments.
+    baseline_args = baseline[baseline.index("eval") :]
+    expected = [
+        cfg["model"] if value == "vllm/test" else value for value in baseline_args
+    ]
+    assert command[command.index("eval") :] == expected

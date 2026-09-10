@@ -84,6 +84,13 @@ def _inspect_eval_index(command: list[str]) -> int | None:
     for index, token in enumerate(command[:-1]):
         if Path(token).name == "inspect" and command[index + 1] == "eval":
             return index + 1
+    for index in range(len(command) - 2):
+        if command[index : index + 3] == [
+            "-m",
+            "agent_baselines.evals.hle_tools_v0.k2_vllm_cli",
+            "eval",
+        ]:
+            return index + 2
     return None
 
 
@@ -146,7 +153,7 @@ def _probe_model_catalog(launch: EvalLaunch) -> bool:
     if not model_id:
         raise SmokeTestError("Inspect model must include an explicit provider/model ID")
     if launch.model_base_url:
-        if provider == "vllm":
+        if provider in {"vllm", "k2-vllm"}:
             key = os.environ.get("VLLM_API_KEY", "").strip()
             variable = "VLLM_API_KEY"
         elif provider == "openai":

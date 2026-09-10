@@ -34,6 +34,10 @@ def _is_inspect_eval(command: list[str]) -> bool:
     return any(
         Path(token).name == "inspect" and command[index + 1] == "eval"
         for index, token in enumerate(command[:-1])
+    ) or any(
+        command[index : index + 3]
+        == ["-m", "agent_baselines.evals.hle_tools_v0.k2_vllm_cli", "eval"]
+        for index in range(len(command) - 2)
     )
 
 

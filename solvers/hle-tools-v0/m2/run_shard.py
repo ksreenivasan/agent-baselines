@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Supervise one bounded HLE shard and its node-local checkpoint publisher."""
+
 from __future__ import annotations
 
 import argparse
@@ -38,8 +39,12 @@ def make_command(config: dict, manifest: Path, local: Path, repo: Path) -> list[
         raise ValueError("this live campaign requires the frozen Keenable backend")
     if task not in targets:
         raise ValueError("unsupported HLE task")
-    command = [
-        executable,
+    prefix = (
+        [sys.executable, "-m", "agent_baselines.evals.hle_tools_v0.k2_vllm_cli"]
+        if config["model"].startswith("k2-vllm/")
+        else [executable]
+    )
+    command = prefix + [
         "eval",
         str(repo / targets[task]),
         "--model",

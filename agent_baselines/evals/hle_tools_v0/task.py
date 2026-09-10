@@ -3,6 +3,7 @@ from pathlib import Path
 from inspect_ai import Task, task
 from inspect_ai.model import Model
 
+from agent_baselines.evals.hle_tools_v0 import k2_vllm  # noqa: F401
 from agent_baselines.evals.hle_tools_v0.dataset import load_hle_dataset
 from agent_baselines.evals.hle_tools_v0.scorer import DEFAULT_JUDGE_MODEL, hle_scorer
 from agent_baselines.solvers.hle_tools_v0.solver import hle_tools_agent

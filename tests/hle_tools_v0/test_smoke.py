@@ -73,14 +73,17 @@ def test_endpoint_requires_explicit_reasoning_history():
         )
 
 
-def test_endpoint_catalog_requires_explicit_token_and_exact_model(monkeypatch):
+@pytest.mark.parametrize("provider", ["vllm", "k2-vllm"])
+def test_endpoint_catalog_requires_explicit_token_and_exact_model(
+    monkeypatch, provider
+):
     launch = smoke.parse_eval_launch(
         [
             "inspect",
             "eval",
             "agent_baselines/evals/hle_direct/task.py@hle_direct",
             "--model",
-            "vllm/served-id",
+            f"{provider}/served-id",
             "--model-base-url",
             "http://model.example/v1",
             "--reasoning-history",
@@ -93,7 +96,9 @@ def test_endpoint_catalog_requires_explicit_token_and_exact_model(monkeypatch):
 
     monkeypatch.setenv("VLLM_API_KEY", "dummy-token")
     response = io.BytesIO(json.dumps({"data": [{"id": "served-id"}]}).encode())
-    monkeypatch.setattr(smoke.urllib.request, "urlopen", lambda *args, **kwargs: response)
+    monkeypatch.setattr(
+        smoke.urllib.request, "urlopen", lambda *args, **kwargs: response
+    )
     assert smoke._probe_model_catalog(launch) is True
 
 
@@ -173,3 +178,49 @@ def test_failed_smoke_warns_and_stops(monkeypatch):
         with pytest.raises(SystemExit) as error:
             runner._smoke_or_stop(command, skip=False, smoke_runner=fail)
     assert error.value.code == 2
+
+
+def test_k2_bootstrap_runs_all_smoke_checks(monkeypatch):
+    runner = _load_runner()
+    command = [
+        sys.executable,
+        "-m",
+        "agent_baselines.evals.hle_tools_v0.k2_vllm_cli",
+        "eval",
+        "solvers/hle-tools-v0/m2/canary.py@hle_tools_canary",
+        "--model",
+        "k2-vllm/IFM/K2-Horizon-375B-A23B",
+        "--model-base-url",
+        "http://model.example/v1",
+        "--reasoning-history",
+        "all",
+    ]
+    calls = []
+
+    async def probe_web_tools(**kwargs):
+        calls.append("web")
+
+    async def probe_model_endpoint(launch):
+        assert launch.model == "k2-vllm/IFM/K2-Horizon-375B-A23B"
+        calls.append("model")
+
+    async def probe_judge_endpoint(launch):
+        calls.append("judge")
+
+    monkeypatch.setattr(smoke, "_probe_web_tools", probe_web_tools)
+    monkeypatch.setattr(
+        smoke, "_probe_sandbox_tools", lambda launch: calls.append("sandbox")
+    )
+    monkeypatch.setattr(
+        smoke, "_probe_model_catalog", lambda launch: calls.append("catalog") or True
+    )
+    monkeypatch.setattr(smoke, "_probe_model_endpoint", probe_model_endpoint)
+    monkeypatch.setattr(smoke, "_probe_judge_endpoint", probe_judge_endpoint)
+    runner._smoke_or_stop(command, skip=False, smoke_runner=smoke.run_smoke_test)
+    assert calls == ["web", "sandbox", "catalog", "model", "judge"]
+
+
+def test_unknown_module_is_not_accepted_as_inspect_bootstrap():
+    command = [sys.executable, "-m", "other_module", "eval"]
+    assert not smoke.is_inspect_eval(command)
+    assert not _load_runner()._is_inspect_eval(command)
