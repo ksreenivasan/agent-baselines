@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -150,6 +151,14 @@ def campaign(tmp_path):
             "ids": ids,
         },
     )
+    save(
+        tmp_path / "dataset-integrity.json",
+        {
+            "revision": config["dataset_revision"],
+            "count": len(ids),
+            "ordered_ids_sha256": hashlib.sha256(json.dumps(ids).encode()).hexdigest(),
+        },
+    )
     source = tmp_path / "source"
     source.mkdir()
     (source / "protocol.yaml").write_text("frozen protocol\n")
@@ -157,6 +166,7 @@ def campaign(tmp_path):
         tmp_path / "PROTOCOL.json",
         {
             "source_root": str(source),
+            "dataset_manifest": "dataset-integrity.json",
             "file_sha256": {"protocol.yaml": file_digest(source / "protocol.yaml")},
             "config_sha256": {cfg.name: file_digest(cfg)},
         },
@@ -510,4 +520,13 @@ def test_diagnostic_phase_is_rejected_even_with_matching_protocol_hash(campaign)
     save(campaign.protocol, protocol)
     campaign.attempt("pilot", [row("a", campaign.config), row("b", campaign.config)])
     with pytest.raises(ValueError, match="diagnostic"):
+        aggregate(campaign)
+
+
+def test_expected_manifest_must_match_frozen_integrity_record(campaign):
+    campaign.attempt("one", [row("a", campaign.config), row("b", campaign.config)])
+    manifest = json.loads(campaign.manifest.read_text())
+    manifest["ids"].reverse()
+    save(campaign.manifest, manifest)
+    with pytest.raises(ValueError, match="frozen dataset integrity"):
         aggregate(campaign)

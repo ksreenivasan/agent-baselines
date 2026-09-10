@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -450,6 +451,17 @@ def aggregate(
         protocol["config_sha256"][config_path.name] == file_digest(config_path),
         "config differs from protocol record",
     )
+    integrity_path = protocol_path.parent / protocol["dataset_manifest"]
+    integrity = read_json(integrity_path)
+    # The campaign integrity record uses default json.dumps separators; recovery
+    # ledgers separately use compact canonical JSON for their ordered-ID hash.
+    require(
+        integrity["revision"] == config["dataset_revision"]
+        and integrity["count"] == len(ids)
+        and integrity["ordered_ids_sha256"]
+        == hashlib.sha256(json.dumps(ids).encode()).hexdigest(),
+        "expected IDs differ from frozen dataset integrity record",
+    )
     for relative, checksum in protocol["file_sha256"].items():
         checked_file(Path(protocol["source_root"]) / relative, checksum)
     inputs, approvals, provenance = sources(
@@ -611,6 +623,7 @@ def aggregate(
         "model": config["model"],
         "dataset_revision": config["dataset_revision"],
         "dataset_ids_sha256": digest(ids),
+        "dataset_integrity_sha256": file_digest(integrity_path),
         "samples": len(ids),
         "correct": correct,
         "incorrect": len(ids) - correct,
