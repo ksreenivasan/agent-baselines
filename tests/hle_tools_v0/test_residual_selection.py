@@ -418,3 +418,69 @@ def test_extra_unindexed_native_archive_is_not_ignored(campaign):
     (first / "logs/unindexed.eval").write_bytes(source.read_bytes())
     with pytest.raises(ValueError, match="exactly its bound"):
         select(campaign, infrastructure=diagnose(first, "a"))
+
+
+def test_legacy_ids_only_manifest_preserves_bytes_and_bound_outcomes(campaign):
+    first = campaign.attempt(
+        "legacy", [row("a", campaign.config, "I")], manifest={"ids": ["a", "b"]}
+    )
+    path = first / "manifest.json"
+    original = path.read_bytes()
+    checksum = file_digest(path)
+    ledger = select(
+        campaign, partial={str(first): ["a"]}, infrastructure=diagnose(first, "b")
+    )
+    assert ledger["counts"] == {"retain": 1, "retry": 1, "unlaunched": 2}
+    assert path.read_bytes() == original and file_digest(path) == checksum
+    assert ledger["attempts"][str(first)]["manifest"]["sha256"] == checksum
+    decisions = {record["id"]: record for record in ledger["samples"]}
+    assert decisions["a"]["selected"]["score"] == "I"
+    assert decisions["a"]["launched_generation_attempts"] == 1
+    assert decisions["b"]["launched_generation_attempts"] == 1
+    assert decisions["c"]["launched_generation_attempts"] == 0
+
+
+@pytest.mark.parametrize("revision", [None, "wrong-revision"])
+def test_explicit_invalid_manifest_revision_is_not_legacy(campaign, revision):
+    campaign.attempt(
+        "explicit",
+        [row("a", campaign.config)],
+        manifest={"ids": ["a"], "dataset_revision": revision},
+    )
+    with pytest.raises(ValueError, match="attempt manifest dataset revision differs"):
+        select(campaign)
+
+
+@pytest.mark.parametrize("case", ["native_revision", "expected_revision", "unknown_id"])
+def test_legacy_manifest_still_requires_native_and_expected_bindings(campaign, case):
+    sample_id = "foreign" if case == "unknown_id" else "a"
+    first = campaign.attempt(
+        "legacy", [row(sample_id, campaign.config)], manifest={"ids": [sample_id]}
+    )
+    if case == "native_revision":
+        path = first / "logs/result.eval"
+        native = read_eval_log(path)
+        native.eval.task_args["dataset_revision"] = "wrong-revision"
+        write_eval_log(native, path)
+        result = json.loads((first / "result.json").read_text())
+        result["archive_sha256"] = file_digest(path)
+        save(first / "result.json", result)
+    elif case == "expected_revision":
+        expected = json.loads(campaign.expected.read_text())
+        expected["dataset_revision"] = "wrong-revision"
+        save(campaign.expected, expected)
+    with pytest.raises(ValueError):
+        select(campaign, partial={str(first): [sample_id]})
+
+
+@pytest.mark.parametrize("result_present", [False, True])
+def test_legacy_manifest_cannot_infer_revision_without_native_archive(
+    campaign, result_present
+):
+    first = campaign.attempt("legacy", manifest={"ids": ["a"]})
+    if result_present:
+        save(first / "result.json", {"complete": False, "publisher_exit": 0})
+    with pytest.raises(
+        ValueError, match="legacy manifest requires bound native archive"
+    ):
+        select(campaign, infrastructure=diagnose(first, "a"))

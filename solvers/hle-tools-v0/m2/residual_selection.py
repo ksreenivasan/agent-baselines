@@ -78,8 +78,11 @@ def read_attempt(
         ids and len(ids) == len(set(ids)) and set(ids) <= expected,
         "unknown or duplicate manifest IDs",
     )
+    # Earlier production shards contained only IDs; their native header must
+    # supply the revision already bound by the config and expected manifest.
+    legacy_manifest = "dataset_revision" not in manifest
     require(
-        manifest.get("dataset_revision") == config["dataset_revision"],
+        legacy_manifest or manifest["dataset_revision"] == config["dataset_revision"],
         "attempt manifest dataset revision differs",
     )
     require(
@@ -109,6 +112,7 @@ def read_attempt(
     durable_archives = sorted((directory / "logs").glob("*.eval"))
     result_path = directory / "result.json"
     if not result_path.exists():
+        require(not legacy_manifest, "legacy manifest requires bound native archive")
         if durable_archives:
             record["unfinalized_archives"] = [str(path) for path in durable_archives]
         require(
@@ -120,6 +124,7 @@ def read_attempt(
     record["result"] = binding(result_path)
     record["complete"] = result.get("complete") is True
     if not result.get("archive"):
+        require(not legacy_manifest, "legacy manifest requires bound native archive")
         if durable_archives:
             record["unfinalized_archives"] = [str(path) for path in durable_archives]
         require(selection is None, "attempt has no archive for partial selection")
