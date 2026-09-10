@@ -201,6 +201,19 @@ Optional `temperature`, `top_p`, and `max_tokens` are sent only when
 non-null. Historical full-matrix tools requests had no explicit output cap;
 do not infer one from an older protocol document.
 
+For K2 tools and canary runs, set
+`model: k2-vllm/IFM/K2-Horizon-375B-A23B`. The shard runner selects
+`python -m agent_baselines.evals.hle_tools_v0.k2_vllm_cli eval ...`, which
+registers the adapter before Inspect resolves the model; use this bootstrap
+for manual tools/canary launches through `run_with_secrets.py` as well.
+The checkpoint's template requires a thinking key even on empty tool-call
+turns. The adapter adds `reasoning_content: ""` only when an assistant replay
+turn has no thinking field. It preserves existing nonempty reasoning, tool
+calls, and history, and leaves the shared endpoint unchanged. Offline replay and bootstrap tests pass. A live canary also replayed an
+empty-reasoning tool turn and then submitted successfully. Direct controls can keep
+`vllm/IFM/K2-Horizon-375B-A23B`: alias registration during preflight currently
+covers tools and canary tasks.
+
 The driver prepares and checks the Enroot sandbox, then supervises each shard.
 Inspect writes native `.eval` archives to node-local scratch, flushing each
 completed sample. The publisher checks every 60 seconds and atomically copies
