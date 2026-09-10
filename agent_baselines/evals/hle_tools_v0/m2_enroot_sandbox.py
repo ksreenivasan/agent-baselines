@@ -8,7 +8,7 @@ import struct
 import tempfile
 import warnings
 from pathlib import Path
-from typing import Literal, overload
+from typing import ClassVar, Literal, overload
 
 from typing_extensions import override
 
@@ -36,6 +36,9 @@ _SECRET_NAMES = {
 
 @sandboxenv(name="m2-enroot")
 class M2EnrootSandbox(SandboxEnvironment):
+    _active: ClassVar[set["M2EnrootSandbox"]] = set()
+    _close_timeout: ClassVar[float] = 5
+
     @override
     @classmethod
     async def sample_init(
@@ -59,6 +62,23 @@ class M2EnrootSandbox(SandboxEnvironment):
             sandbox = environment.as_type(cls)
             await sandbox.close()
             sandbox.directory.cleanup()
+            cls._active.discard(sandbox)
+
+    @override
+    @classmethod
+    async def task_cleanup(
+        cls, task_name: str, config: SandboxEnvironmentConfigType | None, cleanup: bool
+    ) -> None:
+        if not cleanup:
+            return
+        errors: list[Exception] = []
+        for sandbox in list(cls._active):
+            try:
+                await cls.sample_cleanup(task_name, config, {"default": sandbox}, True)
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            raise ExceptionGroup("M2 sandbox cleanup failed", errors)
 
     def __init__(self) -> None:
         super().__init__()
@@ -75,6 +95,8 @@ class M2EnrootSandbox(SandboxEnvironment):
         (rootfs / "home").mkdir(parents=True, exist_ok=True)
         self._namespace_process: asyncio.subprocess.Process | None = None
         self._namespace_socket = self.root / "tmp" / ".m2-exec.sock"
+        self._closed = False
+        self._active.add(self)
 
     @override
     async def exec(
@@ -149,11 +171,13 @@ class M2EnrootSandbox(SandboxEnvironment):
             "cmd": cmd,
             "cwd": container_cwd,
             "env": clean_env,
-            "input": base64.b64encode(
-                input.encode() if isinstance(input, str) else input
-            ).decode("ascii")
-            if input is not None
-            else None,
+            "input": (
+                base64.b64encode(
+                    input.encode() if isinstance(input, str) else input
+                ).decode("ascii")
+                if input is not None
+                else None
+            ),
             "timeout": timeout,
             "output_limit": SandboxEnvironmentLimits.MAX_EXEC_OUTPUT_SIZE,
         }
@@ -168,17 +192,26 @@ class M2EnrootSandbox(SandboxEnvironment):
         )
 
     async def close(self) -> None:
+        self._closed = True
         process = self._namespace_process
         if process is None or process.returncode is not None:
             return
-        process.terminate()
         try:
-            await asyncio.wait_for(process.wait(), timeout=5)
+            process.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(process.wait(), timeout=self._close_timeout)
         except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await asyncio.wait_for(process.wait(), timeout=self._close_timeout)
 
     async def _ensure_namespace(self) -> None:
+        if self._closed:
+            raise RuntimeError("sandbox is closed")
         process = self._namespace_process
         if process is not None and process.returncode is None:
             return
@@ -190,7 +223,11 @@ class M2EnrootSandbox(SandboxEnvironment):
         self._namespace_process = await asyncio.create_subprocess_exec(
             *self._enroot_prefix(),
             "unshare",
-            "-Un",
+            # The namespace init owns every descendant, including daemonized
+            # kernels. Its death reaps them even after they create new sessions.
+            "-Unpf",
+            "--kill-child=SIGKILL",
+            "--mount-proc",
             f"--map-user={uid}",
             f"--map-group={gid}",
             "--keep-caps",
