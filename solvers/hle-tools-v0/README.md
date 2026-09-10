@@ -331,3 +331,42 @@ error/message text, and a safe request ID in guard/sample metadata. The injected
 backend key is redacted before text truncation; raw bodies and headers are not
 stored. Existing historical status-only failures remain ambiguous and are not
 reclassified by this change.
+
+
+## Residual selection
+
+`m2/residual_selection.py` prepares retry manifests without launching work. Its
+expected manifest is the initial new-generation ID set, excluding retained
+historical answers. Supply every current production attempt directory, including
+attempts with only `launch.json`, and revalidate immediately before dispatch.
+
+```bash
+PYTHONPATH=. python solvers/hle-tools-v0/m2/residual_selection.py \
+  --config "$campaign/configs/gpt-sol-full.json" \
+  --expected-manifest "$campaign/ledger-v2/gpt-sol/ids-generate.json" \
+  --protocol "$campaign/PROTOCOL.json" \
+  --source-commit <approved-production-commit> \
+  --attempt <production-shard-attempt-directory> \
+  --partial-selection <clean-IDs-by-attempt-directory.json> \
+  --infrastructure-selection <diagnoses-by-ID.json> \
+  --output "$campaign/residual-selection-1"
+```
+
+Repeat `--attempt` and `--source-commit` as needed; both selection inputs are
+optional. Partial selections map absolute attempt directories to clean IDs from
+failed shards. Each infrastructure selection maps an ID to an object containing
+its latest absolute `attempt` directory, `closed: true`, and concrete
+`evidence`. Closure must follow an actual stopped/finished job check; elapsed
+time is insufficient. Every regeneration requires this explicit diagnosis.
+If durable native archives exist without a finalized result/archive binding,
+the attempt must be reviewed or finalized before regeneration can be selected.
+Valid correct and incorrect scores and saved judge-only answers cannot be
+overridden. Missing results remain held by default and still consume an attempt.
+
+The immutable output contains the per-ID attempt ledger, a saved-answer judge
+queue, aggregate-compatible retained selections, and retry manifests of at most
+200 IDs. Each retry manifest binds its prior launch and selection ledger hashes.
+Initial manifests must be disjoint, retries require their parent attempt records,
+and more than one additional generation is rejected. The command neither
+discovers omitted jobs nor dispatches work; the supervisor must supply the full,
+current attempt inventory. Held and exhausted outcomes stay explicit.

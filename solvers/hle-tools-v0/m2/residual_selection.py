@@ -1,0 +1,526 @@
+#!/usr/bin/env python3
+"""Select bounded production residuals without dispatching model work.
+
+Supply every launched attempt for the initial new-generation ID set, including
+launch-only attempts. Every regeneration needs an explicit infrastructure
+selection: {ID: {"attempt": "/absolute/attempt", "closed": true, "evidence": "..."}}
+Closure must follow an actual stopped/finished job check, never elapsed time.
+Partial selections map absolute failed attempt directories to clean sample IDs.
+Rerun against current complete attempt records immediately before dispatch.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import tempfile
+from collections import Counter
+from pathlib import Path
+from typing import Any
+
+from inspect_ai.log import read_eval_log
+
+from aggregate_campaign import (
+    check_header,
+    check_settings,
+    checked_file,
+    read_json,
+    require,
+)
+from agent_baselines.evals.hle_tools_v0.recovery import (
+    disposition,
+    file_digest,
+    generation_digest,
+    iter_samples,
+)
+
+
+def binding(path: Path) -> dict:
+    return {"path": str(path.resolve()), "sha256": file_digest(path)}
+
+
+def read_attempt(
+    directory: Path,
+    config_path: Path,
+    config: dict,
+    expected: set[str],
+    allowed_commits: set[str],
+    partial: dict,
+) -> tuple[dict, dict]:
+    directory = directory.resolve()
+    launch_path = directory / "launch.json"
+    launch = read_json(launch_path)
+    require(
+        launch["config"] == config
+        and launch["config_sha256"] == file_digest(config_path),
+        "attempt configuration differs from frozen production configuration",
+    )
+    require(
+        launch["source_commit"] in allowed_commits,
+        "attempt source commit is not approved",
+    )
+    require(
+        isinstance(launch.get("started_at"), (int, float)),
+        "attempt has no launch timestamp",
+    )
+    manifests = [
+        arg.split("=", 1)[1]
+        for arg in launch["command"]
+        if arg.startswith("manifest_path=")
+    ]
+    require(len(manifests) == 1, "attempt must bind one manifest")
+    manifest_path = checked_file(manifests[0], launch["manifest_sha256"])
+    manifest = read_json(manifest_path)
+    require(manifest == launch["manifest"], "embedded launch manifest differs")
+    ids = list(map(str, manifest["ids"]))
+    require(
+        ids and len(ids) == len(set(ids)) and set(ids) <= expected,
+        "unknown or duplicate manifest IDs",
+    )
+    require(
+        manifest.get("dataset_revision") == config["dataset_revision"],
+        "attempt manifest dataset revision differs",
+    )
+    require(
+        manifest.get("dataset_variant", "standard") == "standard",
+        "attempt manifest variant differs",
+    )
+    selection = partial.get(str(directory))
+    if selection is not None:
+        require(
+            selection
+            and len(selection) == len(set(selection))
+            and set(selection) <= set(ids),
+            "partial selection has unknown or duplicate IDs",
+        )
+    record = {
+        "attempt": str(directory),
+        "launch": binding(launch_path),
+        "manifest": binding(manifest_path),
+        "ids": ids,
+        "started_at": launch["started_at"],
+        "source_commit": launch["source_commit"],
+        "retry_of": manifest.get("retry_of"),
+        "selection_ledger": manifest.get("selection_ledger"),
+        "generation_attempt": manifest.get("generation_attempt", 1),
+    }
+    rows: dict[str, dict[str, Any]] = {}
+    durable_archives = sorted((directory / "logs").glob("*.eval"))
+    result_path = directory / "result.json"
+    if not result_path.exists():
+        if durable_archives:
+            record["unfinalized_archives"] = [str(path) for path in durable_archives]
+        require(
+            selection is None,
+            "launch-only attempt cannot contribute a partial selection",
+        )
+        return record, rows
+    result = read_json(result_path)
+    record["result"] = binding(result_path)
+    record["complete"] = result.get("complete") is True
+    if not result.get("archive"):
+        if durable_archives:
+            record["unfinalized_archives"] = [str(path) for path in durable_archives]
+        require(selection is None, "attempt has no archive for partial selection")
+        return record, rows
+    archive = checked_file(result["archive"], result["archive_sha256"])
+    require(
+        archive.parent == (directory / "logs").resolve(),
+        "result archive does not belong to its attempt",
+    )
+    require(
+        len(durable_archives) == 1 and durable_archives[0].resolve() == archive,
+        "attempt must contain exactly its bound durable archive",
+    )
+    record["archive"] = binding(archive)
+    require(
+        result.get("publisher_exit") == 0, "archive has no successful final publication"
+    )
+    header = read_eval_log(archive, header_only=True).model_dump(
+        mode="json", exclude_none=True
+    )
+    check_header(header, config, partial=not record["complete"])
+    require(
+        header["eval"]["task_args"].get("manifest_path") == str(manifest_path),
+        "archive manifest path differs from its launch",
+    )
+    revision = header["eval"].get("revision") or {}
+    require(
+        7 <= len(revision.get("commit", "")) <= 40
+        and not revision.get("dirty")
+        and launch["source_commit"].startswith(revision["commit"]),
+        "archive revision differs from clean approved launch",
+    )
+    for row in iter_samples(archive):
+        sample_id = str(row["id"])
+        require(
+            sample_id in ids and sample_id not in rows and row.get("epoch", 1) == 1,
+            "archive has unknown or duplicate ID/epoch",
+        )
+        kind, reason = disposition(row)
+        events = [
+            event
+            for event in row.get("events", [])
+            if event.get("event") == "model" and event.get("model") == config["model"]
+        ]
+        for event in events:
+            check_settings(
+                event.get("config", {}), config, f"actual request for {sample_id}"
+            )
+        if kind in {"retain_score", "judge_only"}:
+            require(events, "saved outcome has no recorded solver request")
+        if kind == "retain_score":
+            require(
+                set(row["scores"]) == {"hle_scorer"}
+                and not row["scores"]["hle_scorer"]
+                .get("metadata", {})
+                .get("hle_judge_repair_failed"),
+                "invalid HLE score or failed judge marker",
+            )
+        rows[sample_id] = {
+            "attempt": str(directory),
+            "disposition": kind,
+            "reason": reason,
+            "generation_sha256": generation_digest(row),
+            "archive": str(archive),
+            "archive_sha256": record["archive"]["sha256"],
+            "selected": kind == "retain_score"
+            and (
+                record["complete"] or (selection is not None and sample_id in selection)
+            ),
+        }
+        if kind == "retain_score":
+            rows[sample_id]["score"] = row["scores"]["hle_scorer"]["value"]
+    if record["complete"]:
+        require(
+            set(rows) == set(ids)
+            and all(r["disposition"] == "retain_score" for r in rows.values()),
+            "completed attempt contains missing or unaccepted rows",
+        )
+    if selection is not None:
+        require(
+            all(
+                sample_id in rows and rows[sample_id]["selected"]
+                for sample_id in selection
+            ),
+            "partial selection includes missing or unaccepted rows",
+        )
+    return record, rows
+
+
+def verify_retry(record: dict, sample_id: str, prior: dict, config_sha: str) -> None:
+    require(record["generation_attempt"] == 2, "retry must be generation attempt 2")
+    references = record.get("retry_of")
+    require(
+        isinstance(references, dict) and set(references) == set(record["ids"]),
+        "retry manifest has incomplete prior bindings",
+    )
+    assert isinstance(references, dict)
+    reference = references[sample_id]
+    require(
+        reference
+        == {"attempt": prior["attempt"], "launch_sha256": prior["launch"]["sha256"]},
+        "retry prior launch binding differs",
+    )
+    require(
+        record["started_at"] > prior["started_at"], "retry predates its prior attempt"
+    )
+    ledger_ref = record.get("selection_ledger")
+    require(isinstance(ledger_ref, dict), "retry has no immutable selection ledger")
+    assert isinstance(ledger_ref, dict)
+    ledger = read_json(checked_file(ledger_ref["path"], ledger_ref["sha256"]))
+    require(
+        ledger.get("config", {}).get("sha256") == config_sha,
+        "retry ledger configuration differs",
+    )
+    entries = [row for row in ledger.get("samples", []) if row["id"] == sample_id]
+    require(
+        len(entries) == 1
+        and entries[0].get("action") == "retry"
+        and entries[0].get("launched_generation_attempts") == 1
+        and entries[0].get("diagnosis", {}).get("closed") is True,
+        "retry was not authorized by the selection ledger",
+    )
+    require(
+        [r["attempt"] for r in entries[0]["attempts"]] == [prior["attempt"]],
+        "retry ledger has different prior attempts",
+    )
+    prior_record = ledger["attempts"][prior["attempt"]]
+    for key in ("launch", "manifest", "result", "archive"):
+        if key in prior_record:
+            require(
+                prior_record[key] == prior.get(key),
+                f"retry ledger prior {key} checksum differs",
+            )
+
+
+def select(
+    config_path: Path,
+    expected_path: Path,
+    protocol_path: Path,
+    output: Path,
+    *,
+    attempt_dirs: list[Path],
+    allowed_commits: set[str],
+    partial: dict | None = None,
+    infrastructure: dict | None = None,
+    shard_size: int = 200,
+) -> dict:
+    config, expected_manifest, protocol = map(
+        read_json, (config_path, expected_path, protocol_path)
+    )
+    require(
+        config.get("run_phase") == "production"
+        and config.get("task") == "hle_tools"
+        and config.get("search_backend") == "keenable",
+        "diagnostic or incompatible configuration",
+    )
+    require(
+        protocol["config_sha256"][config_path.name] == file_digest(config_path),
+        "configuration differs from protocol",
+    )
+    require(
+        protocol.get("generation_policy", {}).get(
+            "max_new_infrastructure_generation_retries"
+        )
+        == 1,
+        "selector requires the frozen one-additional-generation policy",
+    )
+    require(1 <= shard_size <= 200, "retry shard size must be between 1 and 200")
+    for relative, checksum in protocol["file_sha256"].items():
+        checked_file(Path(protocol["source_root"]) / relative, checksum)
+    ids = list(map(str, expected_manifest["ids"]))
+    require(
+        ids and len(ids) == len(set(ids)), "expected IDs must be nonempty and unique"
+    )
+    require(
+        expected_manifest.get("dataset_revision") == config["dataset_revision"]
+        and expected_manifest.get("dataset_variant", "standard") == "standard",
+        "expected manifest protocol differs",
+    )
+    partial, infrastructure = partial or {}, infrastructure or {}
+    require(set(infrastructure) <= set(ids), "infrastructure selection has unknown IDs")
+    directories = [str(path.resolve()) for path in attempt_dirs]
+    require(len(directories) == len(set(directories)), "duplicate attempt directory")
+    require(
+        set(partial) <= set(directories),
+        "partial selection names an unprovided attempt",
+    )
+    attempts, outcomes = {}, {}
+    for directory in directories:
+        record, rows = read_attempt(
+            Path(directory), config_path, config, set(ids), allowed_commits, partial
+        )
+        attempts[directory], outcomes[directory] = record, rows
+    decisions: list[dict[str, Any]] = []
+    for sample_id in ids:
+        launched = sorted(
+            (r for r in attempts.values() if sample_id in r["ids"]),
+            key=lambda r: (r["started_at"], r["attempt"]),
+        )
+        require(
+            len(launched) <= 2,
+            f"{sample_id}: more than one additional generation was launched",
+        )
+        if launched:
+            require(
+                not launched[0]["retry_of"]
+                and not launched[0]["selection_ledger"]
+                and launched[0]["generation_attempt"] == 1,
+                "retry requires its initial attempt record",
+            )
+        if len(launched) == 2:
+            require(
+                launched[1]["retry_of"] is not None,
+                "overlapping initial shard manifests",
+            )
+            verify_retry(launched[1], sample_id, launched[0], file_digest(config_path))
+        history = []
+        for record in launched:
+            row = outcomes[record["attempt"]].get(
+                sample_id,
+                {
+                    "attempt": record["attempt"],
+                    "disposition": "unrecorded",
+                    "reason": (
+                        "unfinalized_durable_archive"
+                        if record.get("unfinalized_archives")
+                        else "missing_result_or_sample"
+                    ),
+                    "selected": False,
+                },
+            )
+            history.append(row)
+        decision = {
+            "id": sample_id,
+            "launched_generation_attempts": len(launched),
+            "attempts": history,
+        }
+        diagnosis = infrastructure.get(sample_id)
+        if diagnosis is not None:
+            require(
+                isinstance(diagnosis, dict)
+                and diagnosis.get("closed") is True
+                and isinstance(diagnosis.get("evidence"), str)
+                and diagnosis["evidence"].strip(),
+                "infrastructure selection requires closed:true and concrete evidence",
+            )
+            require(
+                launched and diagnosis.get("attempt") == launched[-1]["attempt"],
+                "infrastructure selection must name the latest supplied attempt",
+            )
+            require(
+                not launched[-1].get("unfinalized_archives"),
+                "unfinalized durable archives require review before regeneration",
+            )
+            decision["diagnosis"] = diagnosis
+        preserved = [
+            row
+            for row in history
+            if row["disposition"] in {"retain_score", "judge_only"}
+        ]
+        require(
+            not any(row in preserved for row in history[:-1]),
+            "a retry follows an existing valid score or saved judge-only answer",
+        )
+        if preserved:
+            require(
+                diagnosis is None,
+                "cannot regenerate a valid score or saved judge-only answer",
+            )
+            selected = preserved[0]
+            decision["selected"] = selected
+            decision["action"] = (
+                "judge_only"
+                if selected["disposition"] == "judge_only"
+                else "retain" if selected["selected"] else "partial_selection_required"
+            )
+        elif not launched:
+            require(diagnosis is None, "unlaunched ID is not a retry")
+            decision["action"] = "unlaunched"
+        elif len(launched) == 2:
+            decision["action"] = "exhausted"
+        elif diagnosis is not None:
+            decision["action"] = "retry"
+        else:
+            decision["action"] = "held"
+        decisions.append(decision)
+    ledger = {
+        "version": 1,
+        "config": binding(config_path),
+        "expected_manifest": binding(expected_path),
+        "protocol": binding(protocol_path),
+        "allowed_source_commits": sorted(allowed_commits),
+        "max_additional_generation_attempts": 1,
+        "attempts": attempts,
+        "samples": decisions,
+        "counts": dict(Counter(row["action"] for row in decisions)),
+        "partial_selection": partial,
+        "closure_policy": "closed:true attests an actual stopped/finished job check; elapsed time is insufficient",
+        "dispatch_policy": "no dispatch; supply all current launched attempts and revalidate immediately before dispatch",
+    }
+    require(not output.exists(), "selection output already exists")
+    output = output.resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f".{output.name}-", dir=output.parent
+    ) as temporary:
+        stage = Path(temporary) / "selection"
+        stage.mkdir(mode=0o700)
+
+        def write(path: Path, value: object) -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+        write(stage / "ledger.json", ledger)
+        ledger_ref = {
+            "path": str(output / "ledger.json"),
+            "sha256": file_digest(stage / "ledger.json"),
+        }
+        retry = [row for row in decisions if row["action"] == "retry"]
+        for index, start in enumerate(range(0, len(retry), shard_size)):
+            retry_rows = retry[start : start + shard_size]
+            write(
+                stage / "retry" / f"{index:03d}.json",
+                {
+                    "dataset_revision": config["dataset_revision"],
+                    "dataset_variant": "standard",
+                    "ids": [row["id"] for row in retry_rows],
+                    "generation_attempt": 2,
+                    "selection_ledger": ledger_ref,
+                    "retry_of": {
+                        row["id"]: {
+                            "attempt": row["attempts"][0]["attempt"],
+                            "launch_sha256": attempts[row["attempts"][0]["attempt"]][
+                                "launch"
+                            ]["sha256"],
+                        }
+                        for row in retry_rows
+                    },
+                },
+            )
+        write(
+            stage / "judge-only.json",
+            [row for row in decisions if row["action"] == "judge_only"],
+        )
+        write(
+            stage / "retained-selections.json",
+            {
+                str(Path(directory) / "result.json"): [
+                    row["id"]
+                    for row in decisions
+                    if row["action"] == "retain"
+                    and row["selected"]["attempt"] == directory
+                ]
+                for directory in directories
+                if any(
+                    row["action"] == "retain"
+                    and row["selected"]["attempt"] == directory
+                    for row in decisions
+                )
+            },
+        )
+        for path in stage.rglob("*"):
+            if path.is_file():
+                with path.open("rb") as stream:
+                    os.fsync(stream.fileno())
+        os.rename(stage, output)
+    return ledger
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    for flag in ("config", "expected-manifest", "protocol", "output"):
+        parser.add_argument(f"--{flag}", type=Path, required=True)
+    parser.add_argument("--attempt", type=Path, action="append", default=[])
+    parser.add_argument("--source-commit", action="append", default=[])
+    parser.add_argument("--partial-selection", type=Path)
+    parser.add_argument("--infrastructure-selection", type=Path)
+    parser.add_argument("--shard-size", type=int, default=200)
+    args = parser.parse_args()
+    ledger = select(
+        args.config,
+        args.expected_manifest,
+        args.protocol,
+        args.output,
+        attempt_dirs=args.attempt,
+        allowed_commits=set(args.source_commit),
+        partial=read_json(args.partial_selection) if args.partial_selection else None,
+        infrastructure=(
+            read_json(args.infrastructure_selection)
+            if args.infrastructure_selection
+            else None
+        ),
+        shard_size=args.shard_size,
+    )
+    print(
+        json.dumps(
+            {"output": str(args.output), "counts": ledger["counts"]}, sort_keys=True
+        )
+    )
+
+
+if __name__ == "__main__":
+    os.umask(0o077)
+    main()
