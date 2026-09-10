@@ -370,3 +370,51 @@ Initial manifests must be disjoint, retries require their parent attempt records
 and more than one additional generation is rejected. The command neither
 discovers omitted jobs nor dispatches work; the supervisor must supply the full,
 current attempt inventory. Held and exhausted outcomes stay explicit.
+
+## Direct-control finalization
+
+`m2/aggregate_direct_controls.py` is a separate finalizer for the direct controls.
+It does not relax the tools aggregator. The bound `DIRECT_PROTOCOL.json` defines
+the exact dataset, replacement manifests, ownership partition, source files,
+configuration, and endpoint evidence. Migration inputs must supply every
+migration-owned ID; copied historical rows in the same archives are excluded.
+Both partitions must be complete before any final output is published.
+
+```bash
+PYTHONPATH=. python solvers/hle-tools-v0/m2/aggregate_direct_controls.py \
+  --protocol "$campaign/controls/DIRECT_PROTOCOL.json" \
+  --lane glm-flash \
+  --migration-source <closed-migration-source.json> \
+  --replacement-attempt <replacement-attempt/result.json> \
+  --output "$campaign/controls/glm-flash/final"
+```
+
+Repeat either source option as needed. Each migration source is a JSON object
+with `protocol_sha256`, `lane`, `migration_job`, `closed: true`,
+`closure_evidence: {"path": "...", "sha256": "..."}`, and
+`archive: {"path": "...", "sha256": "..."}`. Closure evidence must record an
+actual stopped/finished job check; elapsed time, archive counts, and an
+`afterany` dependency do not establish closure or success. Optional
+`selected_ids` permits explicit clean rows from a closed partial archive.
+The archive evaluation identity must match the frozen lineage. A started
+snapshot is never accepted from counts alone.
+
+Optional `--selections` names a JSON mapping from absolute replacement
+`result.json` paths to explicit clean IDs from failed shards. Every replacement
+must still bind its original approved manifest, launch, config, source revision,
+and single durable archive. Only the initial protocol-bound manifests are
+admitted; residual manifests need a separately bound protocol revision and are
+never admitted automatically. All accepted native rows require exact C/I scoring,
+no error or invalidation, no tool use, and matching recorded solver settings.
+Valid empty-answer incorrect scores are retained. Already valid migration
+generations and scores must remain unchanged. Missing or failed judge results
+stay unresolved; this entrypoint does not adopt judge repairs without a separate
+preserved-generation provenance design and does not regenerate answers.
+
+The migration's inherited header has `max_connections=3` despite task and actual
+request concurrency 12. The finalizer checks this explicit legacy header profile
+and validates actual requests against the migration concurrency. Replacement
+header and request concurrency come from the bound configuration (currently 12).
+The published summary keeps both provenance strata and qualifies comparison
+against the tools condition at concurrency 3. It does not claim identical load,
+an unbiased historically selected subset, or a first-attempt estimate.
