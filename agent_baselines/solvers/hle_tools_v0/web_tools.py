@@ -282,8 +282,8 @@ async def _keenable_search(query: str, max_results: int) -> list[dict[str, str |
     if not key:
         raise RuntimeError("KEENABLE_API_KEY is unavailable; live search is blocked")
     retry_id = None
-    unrecovered_500 = False
-    last_500_diagnostics: dict[str, str | int] | None = None
+    unrecovered_server_error = False
+    last_server_error_diagnostics: dict[str, str | int] | None = None
     attempt_number = 0
     phase = "client_open"
     try:
@@ -308,21 +308,21 @@ async def _keenable_search(query: str, max_results: int) -> list[dict[str, str |
                         )
                     phase = "client_close"
                     raise
-                if response.status_code == 500:
-                    unrecovered_500 = True
+                if response.status_code in {500, 504}:
+                    unrecovered_server_error = True
                     diagnostics = _http_error_diagnostics("keenable", response)
-                    last_500_diagnostics = {
+                    last_server_error_diagnostics = {
                         key: diagnostics[key]
                         for key in ("status", "body_sha256", "request_id")
                         if key in diagnostics
                     }
                 elif response.is_success:
-                    unrecovered_500 = False
+                    unrecovered_server_error = False
                 if retry_id is not None:
                     _search_transport_event(
                         retry_id, attempt_number, terminal=True, response=response
                     )
-                if response.status_code not in {429, 500} or attempt == 1:
+                if response.status_code not in {429, 500, 504} or attempt == 1:
                     break
                 retry_id = uuid4().hex
                 _search_transport_event(retry_id, 1, terminal=False, response=response)
@@ -335,11 +335,11 @@ async def _keenable_search(query: str, max_results: int) -> list[dict[str, str |
             _search_transport_event(
                 retry_id, attempt_number, terminal=True, phase=phase, exception=error
             )
-        if unrecovered_500:
+        if unrecovered_server_error:
             _search_health(
                 "keenable",
                 "search_retry_cancelled",
-                http_diagnostics=last_500_diagnostics,
+                http_diagnostics=last_server_error_diagnostics,
             )
         raise
     results = []
