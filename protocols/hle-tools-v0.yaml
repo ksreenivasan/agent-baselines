@@ -18,7 +18,8 @@ attempts: 1
 models:
   reasoning_effort: high
   temperature: provider_default_for_reasoning_models
-  max_tokens_per_generation: 32768
+  max_tokens_per_generation: null
+  max_tokens_rationale: actual_full_matrix_requests_had_no_explicit_output_cap
   cumulative_token_limit: null
   cumulative_token_limit_rationale: preserve_15_turn_protocol
   max_retries: 1

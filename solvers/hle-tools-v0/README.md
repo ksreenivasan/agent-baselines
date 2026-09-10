@@ -177,3 +177,59 @@ PYTHONPATH=. uv run --project solvers/hle-tools-v0 --frozen -- \
 This static command checks local files and configuration only. It does not replace the automatic live smoke test above.
 
 See `protocols/hle-direct-v0.yaml`, `protocols/hle-tools-v0.yaml`, and `protocols/hle-verified-direct-v0.yaml` for machine-readable protocol records. Older reports describe the previous HLE-Verified/strict-JSON protocol and should not be treated as the current default.
+
+## Bounded M2 continuation
+
+Use a frozen Git worktree with `m2/run_lane.sbatch`. Set `HLE_REPO`,
+`HLE_PYTHON`, `HLE_CONFIG`, `HLE_MANIFEST_DIR`, and `HLE_OUTPUT`.
+The manifest directory contains ordered JSON files with an `ids` array.
+Use 100–200 IDs per shard initially. Each launch uses a new attempt directory;
+a lane lock prevents overlapping drivers.
+
+The configuration declares `task` (`hle_tools`, `hle_direct`, or
+`hle_tools_canary`), `model`, `reasoning_effort`, `concurrency`,
+`max_retries`, `timeout`, `attempt_timeout`, `dataset_path`,
+`dataset_revision`, and `judge_model`. Live tools require
+`search_backend: keenable`. For local serving also set `model_base_url`,
+`reasoning_history`, and `vllm_key_file` (a path, never a key value).
+Optional `temperature`, `top_p`, and `max_tokens` are sent only when
+non-null. Historical full-matrix tools requests had no explicit output cap;
+do not infer one from an older protocol document.
+
+The driver prepares and checks the Enroot sandbox, then supervises each shard.
+Inspect writes native `.eval` archives to node-local scratch, flushing each
+completed sample. The publisher checks every 60 seconds and atomically copies
+valid archives to Weka. A missing/dead publisher, a 300-second publication
+failure, or a fatal tool-health signal stops the worker. Final publication has
+a bounded timeout. Local diagnostics and a failed result remain available if
+Weka cannot accept writes.
+
+Exit 0 requires a successful, non-invalidated final archive, exact expected
+ID/epoch membership, scores, and no unresolved errors or infrastructure
+invalidation. Correct and incorrect scored answers are both retained.
+Exit 3 means a durable, structurally complete shard has isolated known
+provider or judge errors alongside usable scores: the lane continues and
+records residual IDs without claiming completion. Other failures stop the
+lane with exit 2. Diagnose residuals before selecting a finite retry manifest;
+never rerun valid incorrect answers to improve accuracy.
+
+Run `m2/canary.py@hle_tools_canary` before real shards. It checks an actual
+model-generated search → successful fetch → two separate persistent-Python
+turns → plain-text submission trajectory. The supervisor requires both the
+trajectory check and equality judge to pass. Follow with a frozen diagnostic
+pilot at concurrency one and three.
+
+For historical recovery, use
+`python -m agent_baselines.evals.hle_tools_v0.recovery build --help`.
+The streaming builder verifies the frozen dataset and declared source slice,
+records source hashes and attempt provenance, and partitions IDs into retained
+scores, judge-only repair, and new generation. Retained native shards are
+reread to verify their original generation and scores. Keep protected ledgers,
+sample IDs, and raw traces outside Git. Recovery inputs must be explicitly
+chosen original artifacts; an old completion marker is not evidence.
+
+`m2/soak_logging.py` exercises the installed Inspect recorder with representative
+long traces and injected publication failure. Unit tests cover publication,
+tool health, judge retries, strict canaries, recovery, and supervisor failure
+paths. Pin the runtime dependency lock and record the source commit and
+configuration hashes with every launch.
