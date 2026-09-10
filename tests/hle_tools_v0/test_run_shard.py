@@ -168,7 +168,11 @@ def supervisor(monkeypatch, tmp_path):
     output = tmp_path / "unit" / "attempt-1"
     config_path.write_text(json.dumps(config()))
     manifest_path.write_text(json.dumps({"ids": ["a"]}))
-    monkeypatch.setenv("SLURM_JOB_ID", "offline-supervisor-test")
+    monkeypatch.setenv("SLURM_JOB_ID", "12345")
+    proc, cgroup = memory_tree(tmp_path / "memory")
+    monkeypatch.setattr(
+        runner, "job_memory_cgroup", lambda *_args: (cgroup, "/jobs/job_12345")
+    )
     monkeypatch.setenv("SLURM_TMPDIR", str(tmp_path / "scratch"))
     monkeypatch.setattr(
         sys,
@@ -214,6 +218,8 @@ def supervisor(monkeypatch, tmp_path):
         clock=clock,
         circuit_breaker=False,
         final_calls=0,
+        memory_cgroup=cgroup,
+        memory_on_start=None,
     )
 
     class Process:
@@ -225,6 +231,8 @@ def supervisor(monkeypatch, tmp_path):
             self.signals = []
             self.killed = False
             state.processes.append(self)
+            if not self.publisher and state.memory_on_start:
+                state.memory_on_start()
             if not self.publisher and state.circuit_breaker:
                 guard = Path(kwargs["env"]["HLE_TOOL_GUARD_DIR"])
                 guard.mkdir()
@@ -554,3 +562,169 @@ def test_judge_provider_residual_preserves_good_rows_and_is_continuable(
             "reason": "judge_provider_infrastructure_error",
         }
     ]
+
+
+def memory_tree(root):
+    proc = root / "proc"
+    (proc / "self").mkdir(parents=True)
+    mount = root / "cgroup"
+    cgroup = mount / "jobs/job_12345"
+    cgroup.mkdir(parents=True)
+    (proc / "self/cgroup").write_text("0::/jobs/job_12345/step_batch/user/task_0\n")
+    (proc / "self/mountinfo").write_text(f"10 1 0:1 / {mount} rw - cgroup2 cgroup rw\n")
+    (cgroup / "memory.max").write_text(str(64 * 1024**3))
+    (cgroup / "memory.current").write_text(str(4 * 1024**3))
+    (cgroup / "memory.stat").write_text(
+        f"anon {3 * 1024**3}\ninactive_file {1024**3}\n"
+    )
+    (cgroup / "memory.events").write_text("oom 0\noom_kill 0\nmax 0\n")
+    (cgroup / "cgroup.procs").write_text("")
+    return proc, cgroup
+
+
+def fake_process(proc, cgroup, pid, *, job="/jobs/job_12345", rss=100, ppid=1):
+    directory = proc / str(pid)
+    directory.mkdir()
+    # Fields following comm begin at process state (field3); starttime is22.
+    fields = ["S", str(ppid)] + ["0"] * 17 + [str(pid * 10)]
+    (directory / "stat").write_text(f"{pid} (worker name) " + " ".join(fields))
+    (directory / "cgroup").write_text(f"0::{job}/step_batch/user/task_0\n")
+    (directory / "status").write_text(
+        f"Name:	worker name\nVmRSS:	{rss} kB\nRssAnon:	{rss - 1} kB\n"
+        f"VmHWM:	{rss + 5} kB\nVmPeak:	{rss + 10} kB\n"
+    )
+    with (cgroup / "cgroup.procs").open("a") as stream:
+        stream.write(f"{pid}\n")
+
+
+def test_resolves_whole_job_through_nested_cgroup_and_mount_root(tmp_path):
+    proc, cgroup = memory_tree(tmp_path)
+    assert runner.job_memory_cgroup("12345", proc) == (cgroup, "/jobs/job_12345")
+    # A delegated mount can expose /jobs at a different mountpoint.
+    (proc / "self/mountinfo").write_text(
+        f"10 1 0:1 /jobs {cgroup.parent} rw - cgroup2 cgroup rw\n"
+    )
+    assert runner.job_memory_cgroup("12345", proc)[0] == cgroup
+    (proc / "self/mountinfo").write_text(
+        f"10 1 0:1 /jobs/job_12345/step_batch {cgroup} rw - cgroup2 cgroup rw\n"
+    )
+    with pytest.raises(ValueError, match="outside"):
+        runner.job_memory_cgroup("12345", proc)
+
+
+@pytest.mark.parametrize("job", ["1234", "2345", "../12345", "offline", ""])
+def test_memory_guard_rejects_other_or_invalid_jobs(tmp_path, job):
+    proc, _ = memory_tree(tmp_path)
+    with pytest.raises(ValueError):
+        runner.job_memory_cgroup(job, proc)
+
+
+@pytest.mark.parametrize("limit", ["max", "0", "-1", "bad"])
+def test_memory_guard_requires_a_finite_positive_whole_job_limit(tmp_path, limit):
+    proc, cgroup = memory_tree(tmp_path)
+    (cgroup / "memory.max").write_text(limit)
+    with pytest.raises(ValueError, match="finite positive"):
+        runner.memory_snapshot(cgroup, "/jobs/job_12345", proc)
+
+
+def test_memory_pressure_uses_whole_job_working_set_not_page_cache_alone(tmp_path):
+    proc, cgroup = memory_tree(tmp_path)
+    (cgroup / "memory.current").write_text(str(60 * 1024**3))
+    (cgroup / "memory.stat").write_text(
+        f"anon {3 * 1024**3}\ninactive_file {56 * 1024**3}\n"
+    )
+    snapshot = runner.memory_snapshot(cgroup, "/jobs/job_12345", proc)
+    assert snapshot["threshold_bytes"] == 48 * 1024**3
+    assert snapshot["working_set_bytes"] == 4 * 1024**3
+    assert not snapshot["pressure"]
+    (cgroup / "memory.stat").write_text(
+        f"anon {48 * 1024**3}\ninactive_file {12 * 1024**3}\n"
+    )
+    assert runner.memory_snapshot(cgroup, "/jobs/job_12345", proc)["pressure"]
+
+
+def test_process_inventory_includes_orphans_all_steps_but_not_peer_jobs(tmp_path):
+    proc, cgroup = memory_tree(tmp_path)
+    step = cgroup / "step_other/user/task_0"
+    step.mkdir(parents=True)
+    (step / "cgroup.procs").write_text("")
+    fake_process(proc, cgroup, 11, ppid=1)
+    fake_process(proc, step, 12, rss=200)
+    fake_process(proc, cgroup, 13, job="/jobs/job_999", rss=99999)
+    with (step / "cgroup.procs").open("a") as stream:
+        stream.write("999999\n")  # exited before /proc inspection
+    snapshot = runner.memory_snapshot(cgroup, "/jobs/job_12345", proc)
+    assert [p["pid"] for p in snapshot["processes"]] == [12, 11]
+    assert snapshot["pids_unavailable"] == 2
+    assert snapshot["processes"][1]["ppid"] == 1
+    assert snapshot["processes"][0]["start_ticks"] == 120
+    assert snapshot["processes"][0]["comm"] == "worker_name"
+    assert "argv" not in json.dumps(snapshot)
+
+
+def test_memory_inventory_and_rotated_telemetry_are_bounded(tmp_path, monkeypatch):
+    proc, cgroup = memory_tree(tmp_path)
+    for pid in range(1, 5):
+        fake_process(proc, cgroup, pid, rss=pid * 100)
+    monkeypatch.setattr(runner, "_MEMORY_PID_LIMIT", 2)
+    local = tmp_path / "local"
+    local.mkdir()
+    monitor = runner.MemoryMonitor("12345", local, proc)
+    first = monitor.sample()
+    assert [p["pid"] for p in first["processes"]] == [4, 3]
+    assert first["process_records_omitted"] == 2
+    size = (local / "memory.jsonl").stat().st_size
+    monkeypatch.setattr(runner, "_MEMORY_LOG_BYTES", size + 10)
+    for _ in range(5):
+        monitor.sample()
+    assert (local / "memory.previous.jsonl").stat().st_size <= size + 10
+    assert (local / "memory.jsonl").stat().st_size <= size + 10
+    assert len(list(local.glob("memory*.jsonl"))) == 2
+    assert len(json.loads((local / "memory-latest.json").read_text())["processes"]) == 2
+
+
+def test_memory_pressure_stops_owned_evaluator_and_preserves_partial_native(supervisor):
+    supervisor.evaluator_running = True
+    supervisor.header = {"status": "cancelled"}
+    supervisor.memory_on_start = lambda: (
+        supervisor.memory_cgroup / "memory.current"
+    ).write_text(str(52 * 1024**3))
+    assert runner.main() == 2
+    saved = result(supervisor)
+    assert saved["reason"].startswith("memory infrastructure guard:")
+    assert not saved["complete"]
+    assert saved["memory_guard"]["latest"]["pressure"]
+    assert supervisor.processes[1].signals == [signal.SIGTERM]
+    assert supervisor.final_calls == 1 and Path(saved["archive"]).exists()
+    assert (supervisor.output / "memory-latest.json").exists()
+    assert (supervisor.output / "memory.jsonl").exists()
+
+
+def test_memory_read_failure_stops_without_disabling_guard(supervisor):
+    supervisor.evaluator_running = True
+    supervisor.memory_on_start = lambda: (
+        supervisor.memory_cgroup / "memory.stat"
+    ).unlink()
+    assert runner.main() == 2
+    saved = result(supervisor)
+    assert (
+        saved["reason"] == "memory infrastructure guard unavailable: FileNotFoundError"
+    )
+    assert saved["memory_guard"]["failure"] == "FileNotFoundError"
+    assert supervisor.processes[1].signals == [signal.SIGTERM]
+    assert supervisor.final_calls == 1
+
+
+def test_memory_admission_failure_prevents_worker_dispatch(supervisor):
+    (supervisor.memory_cgroup / "memory.max").write_text("max")
+    with pytest.raises(RuntimeError, match="memory infrastructure guard unavailable"):
+        runner.main()
+    assert not supervisor.processes
+    assert not (supervisor.output / "launch.json").exists()
+
+
+def test_cgroup_mountpoint_octal_escapes_are_decoded(tmp_path):
+    proc, cgroup = memory_tree(tmp_path / "with space")
+    mount = str(cgroup.parents[1]).replace(" ", chr(92) + "040")
+    (proc / "self/mountinfo").write_text(f"10 1 0:1 / {mount} rw - cgroup2 cgroup rw\n")
+    assert runner.job_memory_cgroup("12345", proc)[0] == cgroup

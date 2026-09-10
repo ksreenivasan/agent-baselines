@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import signal
 import zipfile
 import subprocess
@@ -25,6 +26,219 @@ def atomic_json(path: Path, value: Any) -> None:
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
+
+
+_MEMORY_INTERVAL = 2
+_MEMORY_LOG_BYTES = 2 * 1024 * 1024
+_MEMORY_PID_LIMIT = 128
+
+
+def job_memory_cgroup(job_id: str, proc: Path = Path("/proc")) -> tuple[Path, str]:
+    """Resolve the whole job through the actual cgroup2 mount, not its batch leaf."""
+    if not job_id.isdecimal():
+        raise ValueError("memory guard requires a numeric Slurm job ID")
+    memberships = [
+        line[3:]
+        for line in (proc / "self/cgroup").read_text().splitlines()
+        if line.startswith("0::")
+    ]
+    if len(memberships) != 1:
+        raise ValueError("memory guard requires one cgroup v2 membership")
+    membership = Path(memberships[0])
+    if not membership.is_absolute() or ".." in membership.parts:
+        raise ValueError("invalid cgroup membership")
+    names = [i for i, name in enumerate(membership.parts) if name == f"job_{job_id}"]
+    if len(names) != 1:
+        raise ValueError("memory guard cannot identify the exact Slurm job ancestor")
+    job = Path(*membership.parts[: names[0] + 1])
+    mounts = []
+    for line in (proc / "self/mountinfo").read_text().splitlines():
+        before, separator, after = line.partition(" - ")
+        if not separator or after.split()[0] != "cgroup2":
+            continue
+        fields = before.split()
+        if len(fields) < 5:
+            continue
+
+        def unescape(value: str) -> str:
+            return re.sub(
+                re.escape(chr(92)) + r"([0-7]{3})", lambda m: chr(int(m[1], 8)), value
+            )
+
+        root, mount = Path(unescape(fields[3])), Path(unescape(fields[4]))
+        if job.is_relative_to(root):
+            mounts.append((len(root.parts), mount / job.relative_to(root)))
+    if not mounts:
+        raise ValueError("whole-job cgroup is outside the visible cgroup2 mount")
+    return max(mounts, key=lambda item: item[0])[1], job.as_posix()
+
+
+def memory_snapshot(
+    cgroup: Path, job_path: str, proc: Path = Path("/proc")
+) -> dict[str, Any]:
+    def pairs(name: str) -> dict[str, int]:
+        return {
+            fields[0]: int(fields[1])
+            for line in (cgroup / name).read_text().splitlines()
+            if len(fields := line.split()) == 2
+        }
+
+    limit = (cgroup / "memory.max").read_text().strip()
+    if not limit.isdecimal() or int(limit) <= 0:
+        raise ValueError("memory guard requires a finite positive whole-job limit")
+    current = int((cgroup / "memory.current").read_text())
+    stats, events = pairs("memory.stat"), pairs("memory.events")
+    if current < 0 or not {"anon", "inactive_file"} <= stats.keys():
+        raise ValueError("memory guard lacks required current/anon/inactive_file data")
+    threshold = int(limit) * 3 // 4
+    working_set = max(0, current - stats["inactive_file"])
+    snapshot: dict[str, Any] = {
+        "time": time.time(),
+        "cgroup": job_path,
+        "current_bytes": current,
+        "anon_bytes": stats["anon"],
+        "inactive_file_bytes": stats["inactive_file"],
+        "working_set_bytes": working_set,
+        "limit_bytes": int(limit),
+        "threshold_bytes": threshold,
+        "metric": "max(0, memory.current - memory.stat.inactive_file)",
+        "events": events,
+        "pressure": current >= threshold and working_set >= threshold,
+    }
+    # This is attribution only. The authoritative pressure metric includes every
+    # descendant even if this bounded process inventory cannot record them all.
+    pids: set[int] = set()
+    groups = 0
+    inventory_truncated = False
+
+    def walk_error(error: OSError) -> None:
+        if not isinstance(error, FileNotFoundError):
+            raise error
+
+    for directory, children, _files in os.walk(cgroup, onerror=walk_error):
+        groups += 1
+        if groups > 512:
+            inventory_truncated = True
+            break
+        children.sort()
+        try:
+            members = (Path(directory) / "cgroup.procs").read_text().split()
+        except FileNotFoundError:
+            if Path(directory) == cgroup:
+                raise
+            continue
+        for value in members:
+            pids.add(int(value))
+            if len(pids) >= 4096:
+                inventory_truncated = True
+                break
+        if inventory_truncated:
+            break
+    processes = []
+    unavailable = 0
+    for pid in sorted(pids):
+        process_dir = proc / str(pid)
+        try:
+            before = (process_dir / "stat").read_text().rpartition(") ")[2].split()
+            membership = (process_dir / "cgroup").read_text().splitlines()
+            if not any(
+                line == f"0::{job_path}" or line.startswith(f"0::{job_path}/")
+                for line in membership
+            ):
+                unavailable += 1
+                continue
+            status = {}
+            for line in (process_dir / "status").read_text().splitlines():
+                key, separator, value = line.partition(":")
+                if separator:
+                    status[key] = value.strip()
+            after = (process_dir / "stat").read_text().rpartition(") ")[2].split()
+            if before[19] != after[19]:
+                unavailable += 1
+                continue
+            record: dict[str, Any] = {
+                "pid": pid,
+                "ppid": int(before[1]),
+                "start_ticks": int(before[19]),
+                "comm": re.sub(r"[^a-zA-Z0-9_.:-]", "_", status["Name"])[:64],
+            }
+            for field in ("VmRSS", "RssAnon", "VmHWM", "VmPeak"):
+                field_value = status.get(field)
+                record[field + "_kib"] = (
+                    int(field_value.split()[0]) if field_value else None
+                )
+            processes.append(record)
+        except (
+            FileNotFoundError,
+            ProcessLookupError,
+            PermissionError,
+            ValueError,
+            IndexError,
+            KeyError,
+        ):
+            unavailable += 1
+    processes.sort(key=lambda item: (item["VmRSS_kib"] or 0, item["pid"]), reverse=True)
+    snapshot.update(
+        processes=processes[:_MEMORY_PID_LIMIT],
+        process_records_omitted=max(0, len(processes) - _MEMORY_PID_LIMIT),
+        pids_observed=len(pids),
+        pids_unavailable=unavailable,
+        inventory_truncated=inventory_truncated,
+    )
+    return snapshot
+
+
+class MemoryMonitor:
+    def __init__(self, job_id: str, local: Path, proc: Path = Path("/proc")):
+        self.proc = proc
+        self.cgroup, self.job_path = job_memory_cgroup(job_id, proc)
+        self.local = local
+        self.latest: dict[str, Any] = {}
+        self.failure: str | None = None
+
+    def sample(self) -> dict[str, Any]:
+        self.latest = memory_snapshot(self.cgroup, self.job_path, self.proc)
+        encoded = json.dumps(self.latest, sort_keys=True) + "\n"
+        path = self.local / "memory.jsonl"
+        if (
+            path.exists()
+            and path.stat().st_size + len(encoded.encode()) > _MEMORY_LOG_BYTES
+        ):
+            path.replace(self.local / "memory.previous.jsonl")
+        with path.open("a") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        atomic_json(self.local / "memory-latest.json", self.latest)
+        return self.latest
+
+    def problem(self) -> str | None:
+        try:
+            if self.sample()["pressure"]:
+                return "memory infrastructure guard: whole-job working set reached 75% limit"
+        except (OSError, ValueError) as error:
+            self.failure = type(error).__name__
+            return f"memory infrastructure guard unavailable: {self.failure}"
+        return None
+
+    def evidence(self) -> dict[str, Any]:
+        return {
+            "telemetry_paths": [
+                str(self.local / name)
+                for name in (
+                    "memory-latest.json",
+                    "memory.jsonl",
+                    "memory.previous.jsonl",
+                )
+            ],
+            "interval_seconds": _MEMORY_INTERVAL,
+            "max_log_bytes_per_file": _MEMORY_LOG_BYTES,
+            "max_log_files": 2,
+            "max_pid_records": _MEMORY_PID_LIMIT,
+            "latest": self.latest,
+            "failure": self.failure,
+            "scope": "whole Slurm job; infrastructure containment, not a tool resource limit",
+        }
 
 
 def make_command(config: dict, manifest: Path, local: Path, repo: Path) -> list[str]:
@@ -263,6 +477,11 @@ def main() -> int:
         "started_at": time.time(),
         "command": command,
     }
+    memory = MemoryMonitor(os.environ["SLURM_JOB_ID"], local)
+    admission_problem = memory.problem()
+    if admission_problem:
+        raise RuntimeError(admission_problem)
+    launch["memory_guard"] = memory.evidence()
     atomic_json(args.output / "launch.json", launch)
     publisher_command = [
         sys.executable,
@@ -300,6 +519,9 @@ def main() -> int:
             )
             started = time.time()
             while process.poll() is None and not stopped:
+                reason = memory.problem()
+                if reason:
+                    break
                 if publisher.poll() is not None:
                     reason = "checkpoint publisher exited"
                     break
@@ -316,7 +538,7 @@ def main() -> int:
                 elif time.time() - started > args.max_durable_lag:
                     reason = "checkpoint publisher never emitted a heartbeat"
                     break
-                time.sleep(5)
+                time.sleep(_MEMORY_INTERVAL)
             if stopped:
                 reason = "supervisor received termination"
             if reason:
@@ -331,7 +553,14 @@ def main() -> int:
                 timeout=args.max_durable_lag,
             )
         # Keep diagnostics available even if the shared filesystem is still failing.
-        for name in ("eval.log", "publisher.log", "checkpoint-status.json"):
+        for name in (
+            "eval.log",
+            "publisher.log",
+            "checkpoint-status.json",
+            "memory-latest.json",
+            "memory.jsonl",
+            "memory.previous.jsonl",
+        ):
             source = local / name
             if source.exists():
                 import shutil
@@ -344,6 +573,7 @@ def main() -> int:
         result = {
             "eval_exit": eval_rc,
             "publisher_exit": final_pub.returncode,
+            "memory_guard": memory.evidence(),
             "reason": reason,
             "finished_at": time.time(),
             "local_root": str(local),
@@ -388,6 +618,7 @@ def main() -> int:
     ) as error:
         result.update(
             complete=False,
+            memory_guard=memory.evidence(),
             reason=f"{type(error).__name__}: {error}",
             finished_at=time.time(),
         )
