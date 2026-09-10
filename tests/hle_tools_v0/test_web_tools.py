@@ -257,6 +257,10 @@ def test_real_inspect_log_retains_sample_invalidation(monkeypatch, tmp_path):
     )  # Acceptance must reject invalidation even when a score exists.
 
 
+_CONTENT_ACCESS_DENIED = {
+    "error": "Upstream forbidden",
+    "message": "The target server denied access to this URL",
+}
 _CONTENT_NOT_FOUND = {
     "error": "Not found",
     "message": "The requested URL could not be found",
@@ -270,6 +274,7 @@ _CONTENT_NOT_EXTRACTABLE = {
 @pytest.mark.parametrize(
     "status,body,expected_error",
     [
+        (403, _CONTENT_ACCESS_DENIED, "content_access_denied"),
         (404, _CONTENT_NOT_FOUND, "content_not_found"),
         (422, _CONTENT_NOT_EXTRACTABLE, "content_not_extractable"),
     ],
@@ -321,6 +326,16 @@ def test_keenable_content_failure_is_normal_and_resets_health(
         ("keenable", 401, _CONTENT_NOT_FOUND),
         ("keenable", 402, _CONTENT_NOT_FOUND),
         ("keenable", 403, _CONTENT_NOT_FOUND),
+        ("keenable", 401, _CONTENT_ACCESS_DENIED),
+        ("keenable", 402, _CONTENT_ACCESS_DENIED),
+        ("keenable", 404, _CONTENT_ACCESS_DENIED),
+        ("keenable", 403, {"error": "Forbidden", "message": "Invalid API key"}),
+        ("keenable", 403, {"error": "Upstream forbidden"}),
+        ("keenable", 403, {**_CONTENT_ACCESS_DENIED, "detail": "unrecognized"}),
+        ("keenable", 403, {**_CONTENT_ACCESS_DENIED, "message": "Access denied"}),
+        ("keenable", 403, "not JSON"),
+        ("keenable", 403, []),
+        ("exa", 403, _CONTENT_ACCESS_DENIED),
         ("keenable", 429, _CONTENT_NOT_EXTRACTABLE),
         ("keenable", 500, _CONTENT_NOT_EXTRACTABLE),
         ("keenable", 503, _CONTENT_NOT_FOUND),
@@ -353,10 +368,16 @@ def test_other_http_failures_still_invalidate(
 
 
 @pytest.mark.parametrize(
-    "status,body", [(404, _CONTENT_NOT_FOUND), (422, _CONTENT_NOT_EXTRACTABLE)]
+    "status,body,expected_error",
+    [
+        (403, _CONTENT_ACCESS_DENIED, "content_access_denied"),
+        (404, _CONTENT_NOT_FOUND, "content_not_found"),
+        (422, _CONTENT_NOT_EXTRACTABLE, "content_not_extractable"),
+    ],
 )
+@pytest.mark.parametrize("score_value", ["C", "I"])
 def test_native_scored_content_failure_remains_retainable(
-    monkeypatch, tmp_path, status, body
+    monkeypatch, tmp_path, status, body, expected_error, score_value
 ):
     from inspect_ai import Task, eval
     from inspect_ai.dataset import Sample
@@ -397,7 +418,7 @@ def test_native_scored_content_failure_remains_retainable(
     @scorer(metrics=[])
     def hle_scorer():
         async def score(state, target):
-            return Score(value="C")
+            return Score(value=score_value)
 
         return score
 
@@ -417,7 +438,8 @@ def test_native_scored_content_failure_remains_retainable(
     row = next(iter_samples(next((tmp_path / "logs").glob("*.eval"))))
     tool_events = [event for event in row["events"] if event["event"] == "tool"]
     assert len(tool_events) == 1
-    assert "content_not_" in str(tool_events[0]["result"])
+    assert expected_error in str(tool_events[0]["result"])
+    assert row["scores"]["hle_scorer"]["value"] == score_value
     assert disposition(row) == ("retain_score", "compatible_completed_sample")
     assert not (tmp_path / "guard" / "events.jsonl").exists()
 
@@ -481,3 +503,76 @@ def test_http_diagnostics_fallback_is_bounded_without_raw_body(
         "status": 404,
         "body_sha256": hashlib.sha256(body).hexdigest(),
     }
+
+
+def test_content_denial_does_not_erase_existing_invalidation(monkeypatch, tmp_path):
+    async def failure(query, max_results):
+        response = httpx.Response(
+            403,
+            json=_CONTENT_ACCESS_DENIED,
+            request=httpx.Request("POST", "https://example.com"),
+        )
+        response.raise_for_status()
+
+    prior_error = {
+        "backend": "keenable",
+        "error": "search_http_403",
+        "sample_id": "sample-42",
+        "epoch": 1,
+        "invalidated": True,
+        "http_diagnostics": {
+            "status": 403,
+            "body_sha256": "4e7ce1cdd15337c3728b96a62cd2bbfddff569b43cdd0e1b43fd8734e8d68041",
+            **_CONTENT_ACCESS_DENIED,
+        },
+    }
+    metadata = {
+        "hle_tools_invalidated": True,
+        "hle_tools_infrastructure_errors": [prior_error],
+    }
+    before = json.loads(json.dumps(metadata))
+    state = SimpleNamespace(sample_id="sample-42", epoch=1, metadata=metadata)
+    monkeypatch.setattr(module, "sample_state", lambda: state)
+    monkeypatch.setattr(module, "_keenable_search", failure)
+    monkeypatch.setenv("HLE_SEARCH_BACKEND", "keenable")
+    monkeypatch.setenv("HLE_TOOL_GUARD_DIR", str(tmp_path))
+
+    assert (
+        asyncio.run(web_search()(query="safe query"))["error"]
+        == "content_access_denied"
+    )
+    assert metadata == before
+    historical = {
+        "id": "sample-42",
+        "epoch": 1,
+        "metadata": metadata,
+        "scores": {"hle_scorer": {"value": "I"}},
+    }
+    assert disposition(historical)[0] == "generate"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"error": "search_http_403"},
+        {
+            "backend": "keenable",
+            "error": "search_http_403",
+            "http_diagnostics": {"status": 403, **_CONTENT_ACCESS_DENIED},
+        },
+    ],
+)
+def test_historical_403_search_error_is_not_reinterpreted(payload):
+    historical = {
+        "id": "sample-42",
+        "epoch": 1,
+        "scores": {"hle_scorer": {"value": "I"}},
+        "events": [
+            {
+                "event": "tool",
+                "function": "web_search",
+                "result": repr(payload),
+            }
+        ],
+    }
+    assert disposition(historical) == ("generate", "web_backend_error")

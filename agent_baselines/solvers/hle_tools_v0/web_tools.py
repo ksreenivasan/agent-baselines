@@ -124,6 +124,13 @@ def _http_error_diagnostics(
 
 def _keenable_content_error(response: httpx.Response) -> dict[str, str | int] | None:
     known = {
+        403: (
+            {
+                "error": "Upstream forbidden",
+                "message": "The target server denied access to this URL",
+            },
+            "content_access_denied",
+        ),
         404: (
             {"error": "Not found", "message": "The requested URL could not be found"},
             "content_not_found",

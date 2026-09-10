@@ -319,18 +319,23 @@ production archives without changing their generation, source, or configuration
 checks. The lane runner does not automatically regenerate these residuals.
 
 Keenable content failures are recognized by the exact HTTP status and JSON body:
+403 with error `Upstream forbidden` and message
+`The target server denied access to this URL`;
 404 with error `Not found` and message `The requested URL could not be found`;
 422 with error `Unprocessable entity` and message
 `The page was reached but content could not be extracted`. These return ordinary
-`content_not_found` or `content_not_extractable` tool errors with the status,
-backend, and provider message. They reset the backend outage counter and do not
+`content_access_denied`, `content_not_found`, or `content_not_extractable` tool
+errors with the status, backend, and provider message. They reset the backend outage counter and do not
 invalidate the sample. Other response bodies, statuses, and backends retain the
 infrastructure guard behavior; status alone never establishes a content failure.
 Unknown HTTP failures also record the status, response-body SHA, bounded parsed
 error/message text, and a safe request ID in guard/sample metadata. The injected
 backend key is redacted before text truncation; raw bodies and headers are not
 stored. Existing historical status-only failures remain ambiguous and are not
-reclassified by this change.
+reclassified by this change. The 403 exception applies only to the exact target
+server denial body: platform authentication failures, unknown or malformed
+responses, additional JSON fields, and other backends remain guarded. Existing
+sample invalidations and fatal sentinels are not cleared by this classification.
 
 
 ## Residual selection
