@@ -1,7 +1,9 @@
 import asyncio
+import hashlib
 import ipaddress
 import json
 import os
+import re
 import socket
 import time
 from contextvars import ContextVar
@@ -21,9 +23,13 @@ _search_failures: dict[str, int] = {}
 
 
 def _search_health(
-    backend: str, error: str | None = None, *, fatal: bool = False
+    backend: str,
+    error: str | None = None,
+    *,
+    fatal: bool = False,
+    http_diagnostics: dict[str, str | int] | None = None,
 ) -> None:
-    """Invalidate affected samples and expose lane outages without logging queries."""
+    """Invalidate affected samples and expose backend failures to the supervisor."""
     _search_failures[backend] = _search_failures.get(backend, 0) + 1 if error else 0
     if error is None:
         return
@@ -39,6 +45,8 @@ def _search_health(
         "fatal": fatal,
         "consecutive_failures": _search_failures[backend],
     }
+    if http_diagnostics is not None:
+        event["http_diagnostics"] = http_diagnostics
     if state is not None:
         state.metadata["hle_tools_invalidated"] = True
         state.metadata.setdefault("hle_tools_infrastructure_errors", []).append(event)
@@ -71,9 +79,78 @@ def _search_backend() -> str:
     return backend
 
 
-def _search_error(backend: str, error: str, *, fatal: bool = False) -> dict[str, str]:
-    _search_health(backend, error, fatal=fatal)
+def _search_error(
+    backend: str,
+    error: str,
+    *,
+    fatal: bool = False,
+    http_diagnostics: dict[str, str | int] | None = None,
+) -> dict[str, str]:
+    _search_health(backend, error, fatal=fatal, http_diagnostics=http_diagnostics)
     return {"backend": backend, "error": error}
+
+
+def _http_error_diagnostics(
+    backend: str, response: httpx.Response
+) -> dict[str, str | int]:
+    details: dict[str, str | int] = {
+        "status": response.status_code,
+        "body_sha256": hashlib.sha256(response.content).hexdigest(),
+    }
+    key_name = {"keenable": "KEENABLE_API_KEY", "exa": "EXA_API_KEY"}.get(backend)
+    key = os.environ.get(key_name, "") if key_name else ""
+    # Keep only bounded structured fields; never retain request headers or raw bodies.
+    if len(response.content) <= 65_536:
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict):
+            for field in ("error", "message"):
+                value = body.get(field)
+                if isinstance(value, str):
+                    if key:
+                        value = value.replace(key, "[REDACTED]")
+                    details[field] = value[:512]
+    request_id = response.headers.get("x-request-id")
+    if (
+        request_id
+        and not (key and key in request_id)
+        and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", request_id)
+    ):
+        details["request_id"] = request_id
+    return details
+
+
+def _keenable_content_error(response: httpx.Response) -> dict[str, str | int] | None:
+    known = {
+        404: (
+            {"error": "Not found", "message": "The requested URL could not be found"},
+            "content_not_found",
+        ),
+        422: (
+            {
+                "error": "Unprocessable entity",
+                "message": "The page was reached but content could not be extracted",
+            },
+            "content_not_extractable",
+        ),
+    }
+    expected = known.get(response.status_code)
+    if expected is None:
+        return None
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    if body != expected[0]:
+        return None
+    return {
+        "backend": "keenable",
+        "error": expected[1],
+        "status": response.status_code,
+        "message": body["message"],
+    }
 
 
 def _urls() -> set[str]:
@@ -213,8 +290,16 @@ def web_search() -> Tool:
                 return _search_error(backend, "search_timeout")
             except httpx.HTTPStatusError as error:
                 status = error.response.status_code
+                if backend == "keenable":
+                    content_error = _keenable_content_error(error.response)
+                    if content_error is not None:
+                        _search_health(backend)
+                        return content_error
                 return _search_error(
-                    backend, f"search_http_{status}", fatal=status in {401, 402, 403}
+                    backend,
+                    f"search_http_{status}",
+                    fatal=status in {401, 402, 403},
+                    http_diagnostics=_http_error_diagnostics(backend, error.response),
                 )
             except httpx.HTTPError:
                 return _search_error(backend, "search_transport_error")

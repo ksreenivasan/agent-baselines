@@ -1,10 +1,12 @@
 import asyncio
+import hashlib
 import json
 from types import SimpleNamespace
 
 import httpx
 import pytest
 
+from agent_baselines.evals.hle_tools_v0.recovery import disposition, iter_samples
 from agent_baselines.solvers.hle_tools_v0 import web_tools as module
 from agent_baselines.solvers.hle_tools_v0.web_tools import (
     _blocked_hle_url,
@@ -253,3 +255,229 @@ def test_real_inspect_log_retains_sample_invalidation(monkeypatch, tmp_path):
     assert (
         sample.scores
     )  # Acceptance must reject invalidation even when a score exists.
+
+
+_CONTENT_NOT_FOUND = {
+    "error": "Not found",
+    "message": "The requested URL could not be found",
+}
+_CONTENT_NOT_EXTRACTABLE = {
+    "error": "Unprocessable entity",
+    "message": "The page was reached but content could not be extracted",
+}
+
+
+@pytest.mark.parametrize(
+    "status,body,expected_error",
+    [
+        (404, _CONTENT_NOT_FOUND, "content_not_found"),
+        (422, _CONTENT_NOT_EXTRACTABLE, "content_not_extractable"),
+    ],
+)
+def test_keenable_content_failure_is_normal_and_resets_health(
+    monkeypatch, tmp_path, status, body, expected_error
+):
+    async def failure(query, max_results):
+        response = httpx.Response(
+            status, json=body, request=httpx.Request("POST", "https://example.com")
+        )
+        response.raise_for_status()
+
+    state = SimpleNamespace(sample_id="sample-42", epoch=1, metadata={})
+    monkeypatch.setattr(module, "sample_state", lambda: state)
+    monkeypatch.setattr(module, "_keenable_search", failure)
+    monkeypatch.setenv("HLE_SEARCH_BACKEND", "keenable")
+    monkeypatch.setenv("HLE_TOOL_GUARD_DIR", str(tmp_path))
+    module._search_failures["keenable"] = 2
+
+    result = asyncio.run(web_search()(query="safe synthetic query"))
+    assert result == {
+        "backend": "keenable",
+        "error": expected_error,
+        "status": status,
+        "message": body["message"],
+    }
+    assert module._search_failures["keenable"] == 0
+    assert state.metadata == {}
+    assert not (tmp_path / "events.jsonl").exists()
+    assert not (tmp_path / "fatal.json").exists()
+
+
+@pytest.mark.parametrize(
+    "backend,status,body",
+    [
+        (
+            "keenable",
+            404,
+            {"error": "Not found", "message": "Upstream service missing"},
+        ),
+        ("keenable", 404, {"error": "Not found"}),
+        ("keenable", 404, {**_CONTENT_NOT_FOUND, "detail": "unrecognized"}),
+        ("keenable", 422, _CONTENT_NOT_FOUND),
+        ("keenable", 404, "not JSON"),
+        ("keenable", 422, []),
+        ("exa", 404, _CONTENT_NOT_FOUND),
+        ("exa", 422, _CONTENT_NOT_EXTRACTABLE),
+        ("keenable", 401, _CONTENT_NOT_FOUND),
+        ("keenable", 402, _CONTENT_NOT_FOUND),
+        ("keenable", 403, _CONTENT_NOT_FOUND),
+        ("keenable", 429, _CONTENT_NOT_EXTRACTABLE),
+        ("keenable", 500, _CONTENT_NOT_EXTRACTABLE),
+        ("keenable", 503, _CONTENT_NOT_FOUND),
+    ],
+)
+def test_other_http_failures_still_invalidate(
+    monkeypatch, tmp_path, backend, status, body
+):
+    async def failure(query, max_results):
+        content = body if isinstance(body, str) else json.dumps(body)
+        response = httpx.Response(
+            status,
+            content=content,
+            request=httpx.Request("POST", "https://example.com"),
+        )
+        response.raise_for_status()
+
+    state = SimpleNamespace(sample_id="sample-42", epoch=1, metadata={})
+    monkeypatch.setattr(module, "sample_state", lambda: state)
+    monkeypatch.setattr(module, "_" + backend + "_search", failure)
+    monkeypatch.setenv("HLE_SEARCH_BACKEND", backend)
+    monkeypatch.setenv("HLE_TOOL_GUARD_DIR", str(tmp_path))
+
+    result = asyncio.run(web_search()(query="safe synthetic query"))
+    assert result == {"backend": backend, "error": f"search_http_{status}"}
+    assert state.metadata["hle_tools_invalidated"] is True
+    event = json.loads((tmp_path / "events.jsonl").read_text())
+    assert event["error"] == f"search_http_{status}"
+    assert event["fatal"] is (status in {401, 402, 403})
+
+
+@pytest.mark.parametrize(
+    "status,body", [(404, _CONTENT_NOT_FOUND), (422, _CONTENT_NOT_EXTRACTABLE)]
+)
+def test_native_scored_content_failure_remains_retainable(
+    monkeypatch, tmp_path, status, body
+):
+    from inspect_ai import Task, eval
+    from inspect_ai.dataset import Sample
+    from inspect_ai.model import ChatMessageAssistant, ModelOutput, execute_tools
+    from inspect_ai.scorer import Score, scorer
+    from inspect_ai.solver import solver
+    from inspect_ai.tool import ToolCall
+
+    async def failure(query, max_results):
+        response = httpx.Response(
+            status, json=body, request=httpx.Request("POST", "https://example.com")
+        )
+        response.raise_for_status()
+
+    @solver
+    def exercise_search():
+        async def solve(state, generate):
+            await execute_tools(
+                [
+                    ChatMessageAssistant(
+                        content="",
+                        tool_calls=[
+                            ToolCall(
+                                id="search-1",
+                                function="web_search",
+                                arguments={"query": "safe query"},
+                            )
+                        ],
+                    )
+                ],
+                [web_search()],
+            )
+            state.output = ModelOutput.from_content("mockllm/model", "answer")
+            return state
+
+        return solve
+
+    @scorer(metrics=[])
+    def hle_scorer():
+        async def score(state, target):
+            return Score(value="C")
+
+        return score
+
+    monkeypatch.setattr(module, "_keenable_search", failure)
+    monkeypatch.setenv("HLE_SEARCH_BACKEND", "keenable")
+    monkeypatch.setenv("HLE_TOOL_GUARD_DIR", str(tmp_path / "guard"))
+    eval(
+        Task(
+            dataset=[Sample(id="sample-42", input="question", target="answer")],
+            solver=exercise_search(),
+            scorer=hle_scorer(),
+        ),
+        model="mockllm/model",
+        display="none",
+        log_dir=str(tmp_path / "logs"),
+    )
+    row = next(iter_samples(next((tmp_path / "logs").glob("*.eval"))))
+    tool_events = [event for event in row["events"] if event["event"] == "tool"]
+    assert len(tool_events) == 1
+    assert "content_not_" in str(tool_events[0]["result"])
+    assert disposition(row) == ("retain_score", "compatible_completed_sample")
+    assert not (tmp_path / "guard" / "events.jsonl").exists()
+
+
+@pytest.mark.parametrize("backend", ["keenable", "exa"])
+def test_unknown_http_diagnostics_redact_key_and_do_not_change_model_error(
+    monkeypatch, tmp_path, backend
+):
+    key = "synthetic-backend-key"
+    body = {
+        "error": "unknown " + key,
+        "message": key + " " + "x" * 1000,
+        "headers": {"X-API-Key": key},
+    }
+    response = httpx.Response(
+        422,
+        json=body,
+        headers={"x-request-id": "request-42"},
+        request=httpx.Request("POST", "https://example.com"),
+    )
+
+    async def failure(query, max_results):
+        response.raise_for_status()
+
+    state = SimpleNamespace(sample_id="sample-42", epoch=1, metadata={})
+    monkeypatch.setattr(module, "sample_state", lambda: state)
+    monkeypatch.setattr(module, "_" + backend + "_search", failure)
+    monkeypatch.setenv("HLE_SEARCH_BACKEND", backend)
+    monkeypatch.setenv(
+        "KEENABLE_API_KEY" if backend == "keenable" else "EXA_API_KEY", key
+    )
+    monkeypatch.setenv("HLE_TOOL_GUARD_DIR", str(tmp_path))
+
+    result = asyncio.run(web_search()(query="safe synthetic query"))
+    assert result == {"backend": backend, "error": "search_http_422"}
+    event = state.metadata["hle_tools_infrastructure_errors"][0]
+    diagnostics = event["http_diagnostics"]
+    assert diagnostics == {
+        "status": 422,
+        "body_sha256": hashlib.sha256(response.content).hexdigest(),
+        "error": "unknown [REDACTED]",
+        "message": ("[REDACTED] " + "x" * 1000)[:512],
+        "request_id": "request-42",
+    }
+    assert key not in json.dumps(event)
+    assert key not in (tmp_path / "events.jsonl").read_text()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [b"not JSON", b"[]", b'{"error":7,"message":null}', b"x" * 65_537],
+)
+@pytest.mark.parametrize("request_id", ["synthetic-backend-key", "unsafe request id"])
+def test_http_diagnostics_fallback_is_bounded_without_raw_body(
+    monkeypatch, body, request_id
+):
+    monkeypatch.setenv("KEENABLE_API_KEY", "synthetic-backend-key")
+    response = httpx.Response(404, content=body, headers={"x-request-id": request_id})
+    diagnostics = module._http_error_diagnostics("keenable", response)
+    assert diagnostics == {
+        "status": 404,
+        "body_sha256": hashlib.sha256(body).hexdigest(),
+    }
