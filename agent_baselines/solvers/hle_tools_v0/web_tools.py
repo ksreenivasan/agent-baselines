@@ -1,15 +1,79 @@
 import asyncio
 import ipaddress
+import json
 import os
 import socket
+import time
 from contextvars import ContextVar
+from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
+from inspect_ai.solver._task_state import sample_state
 from inspect_ai.tool import Tool, tool
 
-_allowed_urls: ContextVar[set[str] | None] = ContextVar("hle_allowed_urls", default=None)
+_allowed_urls: ContextVar[set[str] | None] = ContextVar(
+    "hle_allowed_urls", default=None
+)
 _FIXTURE_URL = "https://example.com/hle-tools-v0-fixture"
+_SEARCH_FAILURE_LIMIT = 3
+_search_failures: dict[str, int] = {}
+
+
+def _search_health(
+    backend: str, error: str | None = None, *, fatal: bool = False
+) -> None:
+    """Invalidate affected samples and expose lane outages without logging queries."""
+    _search_failures[backend] = _search_failures.get(backend, 0) + 1 if error else 0
+    if error is None:
+        return
+    fatal = fatal or _search_failures[backend] >= _SEARCH_FAILURE_LIMIT
+    state = sample_state()
+    event = {
+        "time": time.time(),
+        "backend": backend,
+        "error": error,
+        "sample_id": state.sample_id if state else None,
+        "epoch": state.epoch if state else None,
+        "invalidated": True,
+        "fatal": fatal,
+        "consecutive_failures": _search_failures[backend],
+    }
+    if state is not None:
+        state.metadata["hle_tools_invalidated"] = True
+        state.metadata.setdefault("hle_tools_infrastructure_errors", []).append(event)
+    guard_dir = os.environ.get("HLE_TOOL_GUARD_DIR")
+    if guard_dir:
+        directory = Path(guard_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(event, sort_keys=True) + "\n"
+        # No await in this section: concurrent tool coroutines cannot interleave writes.
+        with (directory / "events.jsonl").open("a") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if fatal:
+            temporary = directory / f".fatal.{os.getpid()}.tmp"
+            with temporary.open("w") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(directory / "fatal.json")
+
+
+def _search_backend() -> str:
+    backend = os.environ.get("HLE_SEARCH_BACKEND", "")
+    if backend not in {"fixture", "exa", "keenable"}:
+        _search_health(backend, "unsupported_or_missing_search_backend", fatal=True)
+        raise RuntimeError(
+            "Set HLE_SEARCH_BACKEND explicitly to exa, keenable, or fixture"
+        )
+    return backend
+
+
+def _search_error(backend: str, error: str, *, fatal: bool = False) -> dict[str, str]:
+    _search_health(backend, error, fatal=fatal)
+    return {"backend": backend, "error": error}
 
 
 def _urls() -> set[str]:
@@ -81,9 +145,7 @@ async def _exa_search(query: str, max_results: int) -> list[dict[str, str | int]
     return results
 
 
-async def _keenable_search(
-    query: str, max_results: int
-) -> list[dict[str, str | int]]:
+async def _keenable_search(query: str, max_results: int) -> list[dict[str, str | int]]:
     key = os.environ.get("KEENABLE_API_KEY")
     if not key:
         raise RuntimeError("KEENABLE_API_KEY is unavailable; live search is blocked")
@@ -108,9 +170,9 @@ async def _keenable_search(
                 "rank": rank,
                 "title": str(item.get("title", "")),
                 "url": url,
-                "snippet": str(
-                    item.get("snippet") or item.get("description", "")
-                )[:2000],
+                "snippet": str(item.get("snippet") or item.get("description", ""))[
+                    :2000
+                ],
                 "backend": "keenable",
             }
         )
@@ -129,7 +191,10 @@ def web_search() -> Tool:
         if not query or len(query) > 512:
             return {"error": "invalid_query_length"}
         max_results = max(1, min(int(max_results), 10))
-        backend = os.environ.get("HLE_SEARCH_BACKEND", "fixture")
+        backend = _search_backend()
+        guard_dir = os.environ.get("HLE_TOOL_GUARD_DIR")
+        if guard_dir and (Path(guard_dir) / "fatal.json").exists():
+            return _search_error(backend, "search_backend_halted", fatal=True)
         if backend == "fixture":
             results = [
                 {
@@ -140,29 +205,23 @@ def web_search() -> Tool:
                     "backend": "fixture",
                 }
             ]
-        elif backend == "exa":
-            try:
-                results = await _exa_search(query, max_results)
-            except httpx.TimeoutException:
-                return {"backend": "exa", "error": "search_timeout"}
-            except httpx.HTTPStatusError as error:
-                return {"backend": "exa", "error": f"search_http_{error.response.status_code}"}
-            except httpx.HTTPError:
-                return {"backend": "exa", "error": "search_transport_error"}
-        elif backend == "keenable":
-            try:
-                results = await _keenable_search(query, max_results)
-            except httpx.TimeoutException:
-                return {"backend": "keenable", "error": "search_timeout"}
-            except httpx.HTTPStatusError as error:
-                return {
-                    "backend": "keenable",
-                    "error": f"search_http_{error.response.status_code}",
-                }
-            except httpx.HTTPError:
-                return {"backend": "keenable", "error": "search_transport_error"}
         else:
-            return {"backend": backend, "error": "unsupported_search_backend"}
+            search = _exa_search if backend == "exa" else _keenable_search
+            try:
+                results = await search(query, max_results)
+            except httpx.TimeoutException:
+                return _search_error(backend, "search_timeout")
+            except httpx.HTTPStatusError as error:
+                status = error.response.status_code
+                return _search_error(
+                    backend, f"search_http_{status}", fatal=status in {401, 402, 403}
+                )
+            except httpx.HTTPError:
+                return _search_error(backend, "search_transport_error")
+            except RuntimeError:
+                _search_health(backend, "search_configuration_error", fatal=True)
+                raise
+        _search_health(backend)
         _urls().update(str(result["url"]) for result in results)
         return results
 
@@ -190,11 +249,19 @@ def fetch_url() -> Tool:
             return {"url": url, "error": "non_public_url"}
         try:
             async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
-                async with client.stream("GET", url, headers={"user-agent": "hle-tools-v0/0.1"}) as response:
+                async with client.stream(
+                    "GET", url, headers={"user-agent": "hle-tools-v0/0.1"}
+                ) as response:
                     if response.is_error:
-                        return {"url": url, "error": f"fetch_http_{response.status_code}"}
+                        return {
+                            "url": url,
+                            "error": f"fetch_http_{response.status_code}",
+                        }
                     content_type = response.headers.get("content-type", "")
-                    if not any(kind in content_type for kind in ("text/", "application/json", "application/xml")):
+                    if not any(
+                        kind in content_type
+                        for kind in ("text/", "application/json", "application/xml")
+                    ):
                         return {"url": url, "error": "unsupported_content_type"}
                     body = bytearray()
                     async for chunk in response.aiter_bytes():
@@ -207,7 +274,12 @@ def fetch_url() -> Tool:
             return {"url": url, "error": "fetch_transport_error"}
         text = bytes(body).decode(response.encoding or "utf-8", errors="replace")
         truncated = len(text) > 20_000
-        return {"url": url, "status": response.status_code, "text": text[:20_000], "truncated": truncated}
+        return {
+            "url": url,
+            "status": response.status_code,
+            "text": text[:20_000],
+            "truncated": truncated,
+        }
 
     return execute
 
@@ -217,4 +289,5 @@ def reset_web_state() -> None:
 
 
 def hle_web_tools() -> list[Tool]:
+    _search_backend()
     return [web_search(), fetch_url()]

@@ -70,7 +70,8 @@ def test_final_turn_exposes_only_submit():
     assert observed_tools[-1] == ["submit"]
 
 
-def test_hle_prompt_and_submit_tool_use_plain_hle_response():
+def test_hle_prompt_and_submit_tool_use_plain_hle_response(monkeypatch):
+    monkeypatch.setenv("HLE_SEARCH_BACKEND", "fixture")
     submission = "Explanation: counted\nExact Answer: 1\nConfidence: 100%"
 
     def output(messages, tools, tool_choice, config):
