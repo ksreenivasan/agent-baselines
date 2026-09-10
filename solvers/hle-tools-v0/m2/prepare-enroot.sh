@@ -16,7 +16,20 @@ export M2_ENROOT_CONTAINER="${M2_ENROOT_CONTAINER:-hle-tools-${SLURM_JOB_ID}}"
 
 mkdir -p "$ENROOT_CACHE_PATH" "$ENROOT_DATA_PATH" "$ENROOT_RUNTIME_PATH" "$ENROOT_TEMP_PATH"
 image="$enroot_root/python-3.11.sqsh"
-if [[ ! -f "$image" ]]; then
+if [[ -n "${M2_ENROOT_IMAGE:-}" ]]; then
+  : "${M2_ENROOT_IMAGE_SHA256:?set the frozen sandbox image SHA256}"
+  actual_digest=$(sha256sum "$M2_ENROOT_IMAGE")
+  [[ "${actual_digest%% *}" == "$M2_ENROOT_IMAGE_SHA256" ]] || {
+    echo "frozen sandbox source image hash mismatch" >&2; return 2;
+  }
+  if [[ ! -f "$image" ]]; then
+    cp "$M2_ENROOT_IMAGE" "$image"
+  fi
+  actual_digest=$(sha256sum "$image")
+  [[ "${actual_digest%% *}" == "$M2_ENROOT_IMAGE_SHA256" ]] || {
+    echo "local sandbox image hash mismatch" >&2; return 2;
+  }
+elif [[ ! -f "$image" ]]; then
   enroot import -o "$image" docker://python:3.11-slim-bookworm
 fi
 if [[ ! -d "$ENROOT_DATA_PATH/$M2_ENROOT_CONTAINER" ]]; then
