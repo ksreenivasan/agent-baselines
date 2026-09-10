@@ -142,6 +142,9 @@ def hle_tools_canary():
                     "with exactly the code probe_value = 17 (no print). In a separate later python_session call, "
                     "execute exactly print(probe_value + 25), without assigning it again. Finally call submit with an HLE-formatted "
                     "plain-text response giving that calculated number as Exact Answer. "
+                    "Invoke submit using the same tool-call mechanism as python_session, "
+                    "with one string argument named submission. A plain response or JSON "
+                    "list describing submit does not complete this check. "
                     "Carry out every step even if you already know the answer."
                 ),
                 target="42",

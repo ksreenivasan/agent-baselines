@@ -139,3 +139,13 @@ def test_tool_payload_is_never_executed():
     items = messages()
     items[1].content = "__import__('builtins').print('not a literal')"
     assert not canary.check_trajectory(items, ANSWER, False)[0]
+
+
+def test_canary_requires_native_submit_instead_of_describing_it(monkeypatch):
+    monkeypatch.setenv("HLE_SEARCH_BACKEND", "fixture")
+    prompt = canary.hle_tools_canary().dataset[0].input
+    assert (
+        "Invoke submit using the same tool-call mechanism as python_session" in prompt
+    )
+    assert "one string argument named submission" in prompt
+    assert "JSON list describing submit does not complete this check" in prompt
