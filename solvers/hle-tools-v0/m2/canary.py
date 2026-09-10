@@ -59,7 +59,11 @@ def check_trajectory(messages, completion: str, invalidated: bool) -> tuple[bool
                 try:
                     payload = json.loads(reply.text)
                 except json.JSONDecodeError:
-                    return False, f"{call.function} returned an invalid payload"
+                    # Inspect 0.3.203 renders native dict/list tool results with repr.
+                    try:
+                        payload = ast.literal_eval(reply.text)
+                    except (ValueError, SyntaxError):
+                        return False, f"{call.function} returned an invalid payload"
                 if step == 0:
                     if not isinstance(payload, list) or not payload:
                         return False, "Search returned no usable results"
@@ -130,8 +134,11 @@ def hle_tools_canary():
                 id="hle-tools-canary",
                 input=(
                     "This is an integration check, not a research question. "
-                    "First call web_search for the official Python documentation. "
-                    "Fetch one URL returned by that search. Then call python_session "
+                    "First call web_search with the query "
+                    "'site:docs.python.org/3/library/math.html Python math documentation'. "
+                    "Fetch a specific documentation page URL returned by that search "
+                    "(prefer https://docs.python.org/3/library/math.html, avoid the "
+                    "redirecting documentation root). Then call python_session "
                     "with exactly the code probe_value = 17 (no print). In a separate later python_session call, "
                     "execute exactly print(probe_value + 25), without assigning it again. Finally call submit with an HLE-formatted "
                     "plain-text response giving that calculated number as Exact Answer. "

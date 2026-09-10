@@ -83,3 +83,57 @@ def test_header_does_not_parse_sample_payload(tmp_path):
     path = tmp_path / "source.json"
     path.write_text('{"version": 2, "invalidated": false, "samples": [invalid JSON')
     assert read_json_header(path) == {"version": 2, "invalidated": False}
+
+
+def test_native_repr_search_failures_and_backends_are_detected():
+    for result in (
+        repr({"backend": "keenable", "error": "search_timeout"}),
+        repr({"backend": "exa", "error": "search_http_402"}),
+        repr([{"url": "https://example.com", "backend": "exa"}]),
+        repr([{"url": "https://example.com", "backend": "fixture"}]),
+    ):
+        value = sample()
+        value["events"] = [
+            {"event": "tool", "function": "web_search", "result": result}
+        ]
+        assert not validate_samples([value], ["a"])["valid"]
+
+
+def test_native_repr_keenable_and_model_arguments_remain_ordinary():
+    for result in (
+        repr([{"url": "https://example.com", "backend": "keenable"}]),
+        repr({"error": "invalid_query_length"}),
+        "[]",
+    ):
+        value = sample()
+        value["events"] = [
+            {"event": "tool", "function": "web_search", "result": result}
+        ]
+        assert validate_samples([value], ["a"])["valid"]
+    value["events"] = [
+        {
+            "event": "tool",
+            "function": "fetch_url",
+            "result": repr({"error": "fetch_http_404"}),
+        }
+    ]
+    assert validate_samples([value], ["a"])["valid"]
+
+
+def test_completion_requires_valid_hle_score_values():
+    for scores in (
+        {"hle_scorer": {"value": "invalid"}},
+        {"hle_scorer": {"value": 1}},
+        {"hle_scorer": {}},
+        {"hle_scorer": "C"},
+        {"trajectory": {"value": "C"}},
+        {"hle_scorer": {"value": "C"}, "trajectory": {"value": "maybe"}},
+    ):
+        assert not validate_samples([{**sample(), "scores": scores}], ["a"])["valid"]
+    for scores in (
+        {"hle_scorer": {"value": "C"}},
+        {"hle_scorer": {"value": "I"}},
+        {"agent_baselines/hle_scorer": {"value": "C"}},
+        {"hle_scorer": {"value": "C"}, "trajectory": {"value": "C"}},
+    ):
+        assert validate_samples([{**sample(), "scores": scores}], ["a"])["valid"]

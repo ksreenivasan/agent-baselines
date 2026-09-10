@@ -99,3 +99,43 @@ def test_fixture_search_and_invalidated_sample_reject_canary():
     )
     assert not canary.check_trajectory(items, ANSWER, False)[0]
     assert not canary.check_trajectory(messages(), ANSWER, True)[0]
+
+
+def test_native_inspect_python_repr_payloads():
+    items = messages()
+    items[1].content = repr(
+        [{"rank": 1, "url": "https://docs.python.org/", "backend": "keenable"}]
+    )
+    items[3].content = repr(
+        {
+            "url": "https://docs.python.org/",
+            "status": 200,
+            "text": "Python docs",
+            "truncated": False,
+        }
+    )
+    assert canary.check_trajectory(items, ANSWER, False)[0]
+
+
+def test_native_redirect_does_not_prove_content_retrieval():
+    items = messages()
+    items[1].content = repr(
+        [{"url": "https://docs.python.org/", "backend": "keenable"}]
+    )
+    items[3].content = repr(
+        {
+            "url": "https://docs.python.org/",
+            "status": 302,
+            "text": "<html><h1>302 Found</h1></html>",
+            "truncated": False,
+        }
+    )
+    valid, reason = canary.check_trajectory(items, ANSWER, False)
+    assert not valid
+    assert reason == "Fetch did not retrieve a searched URL successfully"
+
+
+def test_tool_payload_is_never_executed():
+    items = messages()
+    items[1].content = "__import__('builtins').print('not a literal')"
+    assert not canary.check_trajectory(items, ANSWER, False)[0]

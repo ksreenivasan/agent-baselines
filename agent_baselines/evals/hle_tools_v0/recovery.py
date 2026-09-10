@@ -5,6 +5,7 @@ small native Inspect shards; the original logs are never rewritten.
 """
 
 import argparse
+import ast
 import copy
 import hashlib
 import json
@@ -100,7 +101,11 @@ def infrastructure_reasons(sample: dict[str, Any]) -> list[str]:
             try:
                 result = json.loads(result)
             except json.JSONDecodeError:
-                pass
+                # Inspect renders native Python tool dict/list results with repr.
+                try:
+                    result = ast.literal_eval(result)
+                except (ValueError, SyntaxError):
+                    pass
         # Individual URL failures and invalid model arguments are normal tool
         # outcomes; only search-service failures contaminate infrastructure.
         if event.get("function") == "web_search":
@@ -150,8 +155,16 @@ def disposition(sample: dict[str, Any]) -> tuple[str, str]:
         ):
             return "generate", "provider_infrastructure_error"
         return "terminal_error", "unclassified_model_or_execution_error"
-    if not sample.get("scores"):
+    scores = sample.get("scores")
+    if not scores:
         return "generate", "missing_score"
+    if not isinstance(scores, dict) or any(
+        not isinstance(value, dict) or value.get("value") not in ("C", "I")
+        for value in scores.values()
+    ):
+        return "generate", "invalid_score_schema"
+    if sum(name.split("/")[-1] == "hle_scorer" for name in scores) != 1:
+        return "generate", "missing_or_ambiguous_hle_score"
     return "retain_score", "compatible_completed_sample"
 
 
