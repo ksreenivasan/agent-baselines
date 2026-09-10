@@ -214,7 +214,124 @@ def read_attempt(
     return record, rows
 
 
-def verify_retry(record: dict, sample_id: str, prior: dict, config_sha: str) -> None:
+def read_preflight_exclusion(
+    path: Path | None, protocol: dict, attempts: dict, outcomes: dict
+) -> dict | None:
+    reference = protocol.get("preflight_exclusion")
+    require(
+        (path is None) == (reference is None),
+        "preflight exclusion must be explicitly supplied and protocol-bound",
+    )
+    if path is None:
+        return None
+    require(reference == binding(path), "preflight exclusion protocol binding differs")
+    proof = read_json(path)
+    require(
+        isinstance(proof, dict)
+        and proof.get("version") == 1
+        and proof.get("kind") == "closed_preflight_before_benchmark"
+        and proof.get("benchmark_admissions") == 0
+        and proof.get("max_replacement_admissions") == 1
+        and proof.get("raw_assignment_retained") is True
+        and proof.get("reviewed_pre_exec_failure") is True,
+        "one closed preflight exclusion with one replacement admission is required",
+    )
+    directory = str(Path(proof["attempt"]).resolve())
+    require(directory in attempts, "preflight exclusion names an unprovided attempt")
+    record = attempts[directory]
+
+    def evidence(key: str, expected: Path | None = None) -> Path:
+        item = proof[key]
+        result = checked_file(item["path"], item["sha256"])
+        require(expected is None or result == expected, f"wrong preflight {key} path")
+        return result
+
+    root = Path(directory)
+    launch_path = evidence("launch", root / "launch.json")
+    manifest_path = evidence("manifest", Path(record["manifest"]["path"]))
+    result_path = evidence("result", root / "result.json")
+    log_path = evidence("eval_log", root / "eval.log")
+    publisher_path = evidence("publisher_status", root / "checkpoint-status.json")
+    launch, result, publisher = map(
+        read_json, (launch_path, result_path, publisher_path)
+    )
+    require(
+        proof["ids"] == record["ids"]
+        and proof["source_commit"] == record["source_commit"]
+        and proof["job_id"] == launch.get("job_id")
+        and proof["launch"] == record["launch"]
+        and proof["manifest"] == record["manifest"]
+        and proof["result"] == record.get("result")
+        and read_json(manifest_path) == launch["manifest"]
+        and record["generation_attempt"] == 2,
+        "preflight exclusion identity differs from its retry assignment",
+    )
+    require(
+        not outcomes[directory]
+        and not record.get("archive")
+        and not record.get("unfinalized_archives")
+        and not list((root / "logs").glob("*.eval"))
+        and result.get("complete") is False
+        and result.get("eval_exit") == 2
+        and result.get("publisher_exit") == 1
+        and not result.get("archive")
+        and not result.get("archive_sha256"),
+        "preflight exclusion cannot contain benchmark outcomes or archives",
+    )
+    require(
+        all(
+            publisher.get(key) == 0
+            for key in ("expected", "published", "total_published")
+        )
+        and publisher.get("errors") == []
+        and publisher.get("last_published_at") is None
+        and publisher.get("last_error") is None,
+        "preflight publisher observed benchmark archive activity",
+    )
+    wrapper, smoke = evidence("wrapper"), evidence("smoke")
+    require(
+        wrapper.name == "run_with_secrets.py"
+        and smoke == wrapper.with_name("smoke.py"),
+        "preflight reviewed source files differ from the wrapper entry point",
+    )
+    command = launch["command"]
+    require(
+        len(command) > 2
+        and command[1] == str(wrapper)
+        and "--skip-smoke-test" not in command
+        and any(
+            Path(token).name == "inspect" and command[index + 1] == "eval"
+            for index, token in enumerate(command[:-1])
+        ),
+        "preflight wrapper was not the launch entry point",
+    )
+    text = log_path.read_text()
+    marker = (
+        f"{wrapper}:67: RuntimeWarning: HLE smoke test failed; evaluation stopped: "
+        f"evaluated-model endpoint returned an empty response for {launch['config']['model']}"
+    )
+    require(
+        text.count(marker) == 1 and "HLE smoke test passed:" not in text,
+        "missing positive pre-exec model preflight failure evidence",
+    )
+    closure = read_json(evidence("closure"))
+    require(
+        closure.get("job_id") == proof["job_id"]
+        and closure.get("state") == "FAILED"
+        and closure.get("exit_code") == "2:0"
+        and closure.get("closed") is True,
+        "preflight job lacks exact terminal closure evidence",
+    )
+    return {"attempt": directory, "binding": reference}
+
+
+def verify_retry(
+    record: dict,
+    sample_id: str,
+    prior: dict,
+    config_sha: str,
+    exclusion: dict | None = None,
+) -> None:
     require(record["generation_attempt"] == 2, "retry must be generation attempt 2")
     references = record.get("retry_of")
     require(
@@ -247,8 +364,17 @@ def verify_retry(record: dict, sample_id: str, prior: dict, config_sha: str) -> 
         and entries[0].get("diagnosis", {}).get("closed") is True,
         "retry was not authorized by the selection ledger",
     )
+    history = entries[0]["attempts"]
+    skipped = [r for r in history if r.get("counts_toward_generation_budget") is False]
+    if skipped:
+        require(
+            exclusion is not None
+            and ledger.get("preflight_exclusion") == exclusion["binding"]
+            and [r["attempt"] for r in skipped] == [exclusion["attempt"]],
+            "retry ledger has an unapproved preflight exclusion",
+        )
     require(
-        [r["attempt"] for r in entries[0]["attempts"]] == [prior["attempt"]],
+        [r["attempt"] for r in history if r not in skipped] == [prior["attempt"]],
         "retry ledger has different prior attempts",
     )
     prior_record = ledger["attempts"][prior["attempt"]]
@@ -271,6 +397,7 @@ def select(
     partial: dict | None = None,
     infrastructure: dict | None = None,
     shard_size: int = 200,
+    preflight_exclusion: Path | None = None,
 ) -> dict:
     config, expected_manifest, protocol = map(
         read_json, (config_path, expected_path, protocol_path)
@@ -318,12 +445,20 @@ def select(
             Path(directory), config_path, config, set(ids), allowed_commits, partial
         )
         attempts[directory], outcomes[directory] = record, rows
+    exclusion = read_preflight_exclusion(
+        preflight_exclusion, protocol, attempts, outcomes
+    )
     decisions: list[dict[str, Any]] = []
     for sample_id in ids:
-        launched = sorted(
+        assigned = sorted(
             (r for r in attempts.values() if sample_id in r["ids"]),
             key=lambda r: (r["started_at"], r["attempt"]),
         )
+        launched = [
+            record
+            for record in assigned
+            if exclusion is None or record["attempt"] != exclusion["attempt"]
+        ]
         require(
             len(launched) <= 2,
             f"{sample_id}: more than one additional generation was launched",
@@ -335,14 +470,20 @@ def select(
                 and launched[0]["generation_attempt"] == 1,
                 "retry requires its initial attempt record",
             )
-        if len(launched) == 2:
+        for record in assigned[1:]:
             require(
-                launched[1]["retry_of"] is not None,
+                record["retry_of"] is not None,
                 "overlapping initial shard manifests",
             )
-            verify_retry(launched[1], sample_id, launched[0], file_digest(config_path))
+            verify_retry(
+                record, sample_id, assigned[0], file_digest(config_path), exclusion
+            )
+        require(
+            not assigned or assigned[0] in launched,
+            "preflight exclusion cannot replace an initial benchmark attempt",
+        )
         history = []
-        for record in launched:
+        for record in assigned:
             row = outcomes[record["attempt"]].get(
                 sample_id,
                 {
@@ -356,9 +497,17 @@ def select(
                     "selected": False,
                 },
             )
+            if exclusion is not None and record["attempt"] == exclusion["attempt"]:
+                row = {
+                    **row,
+                    "disposition": "preflight_not_admitted",
+                    "reason": "verified_closed_model_preflight_before_benchmark",
+                    "counts_toward_generation_budget": False,
+                }
             history.append(row)
         decision = {
             "id": sample_id,
+            "raw_assigned_launches": len(assigned),
             "launched_generation_attempts": len(launched),
             "attempts": history,
         }
@@ -425,6 +574,13 @@ def select(
         "closure_policy": "closed:true attests an actual stopped/finished job check; elapsed time is insufficient",
         "dispatch_policy": "no dispatch; supply all current launched attempts and revalidate immediately before dispatch",
     }
+    if exclusion is not None:
+        ledger["preflight_exclusion"] = exclusion["binding"]
+        ledger["attempt_accounting"] = (
+            "All raw assignments remain in attempts/history. Exactly the protocol-bound "
+            "closed preflight is excluded from generation-budget counts; every other "
+            "assignment remains counted, including ambiguous interrupted work."
+        )
     require(not output.exists(), "selection output already exists")
     output = output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -503,6 +659,7 @@ def main() -> None:
     parser.add_argument("--partial-selection", type=Path)
     parser.add_argument("--infrastructure-selection", type=Path)
     parser.add_argument("--shard-size", type=int, default=200)
+    parser.add_argument("--preflight-exclusion", type=Path)
     args = parser.parse_args()
     ledger = select(
         args.config,
@@ -518,6 +675,7 @@ def main() -> None:
             else None
         ),
         shard_size=args.shard_size,
+        preflight_exclusion=args.preflight_exclusion,
     )
     print(
         json.dumps(

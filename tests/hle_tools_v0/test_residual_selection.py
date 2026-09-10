@@ -484,3 +484,227 @@ def test_legacy_manifest_cannot_infer_revision_without_native_archive(
         ValueError, match="legacy manifest requires bound native archive"
     ):
         select(campaign, infrastructure=diagnose(first, "a"))
+
+
+def preflight_case(state):
+    first = state.attempt("first", ids=["a"])
+    select(state, name="before-preflight", infrastructure=diagnose(first, "a"))
+    manifest = json.loads((state.root / "before-preflight/retry/000.json").read_text())
+    failed = state.attempt("preflight", manifest=manifest)
+    source = state.root / "reviewed-source"
+    wrapper = save(source / "run_with_secrets.py", "reviewed wrapper")
+    smoke = save(source / "smoke.py", "reviewed health-only probe")
+    launch = json.loads((failed / "launch.json").read_text())
+    launch["job_id"] = "test-job"
+    launch["command"] = [
+        "python",
+        str(wrapper),
+        "inspect",
+        "eval",
+        f"manifest_path={failed / 'manifest.json'}",
+    ]
+    save(failed / "launch.json", launch)
+    result = save(
+        failed / "result.json",
+        {
+            "complete": False,
+            "eval_exit": 2,
+            "publisher_exit": 1,
+        },
+    )
+    log = failed / "eval.log"
+    log.write_text(
+        f"{wrapper}:67: RuntimeWarning: HLE smoke test failed; evaluation stopped: "
+        f"evaluated-model endpoint returned an empty response for {state.config['model']}\n"
+    )
+    publisher = save(
+        failed / "checkpoint-status.json",
+        {
+            "expected": 0,
+            "published": 0,
+            "total_published": 0,
+            "errors": [],
+            "last_published_at": None,
+            "last_error": None,
+        },
+    )
+    closure = save(
+        state.root / "closure.json",
+        {
+            "closed": True,
+            "job_id": "test-job",
+            "state": "FAILED",
+            "exit_code": "2:0",
+        },
+    )
+    proof = {
+        "version": 1,
+        "kind": "closed_preflight_before_benchmark",
+        "attempt": str(failed),
+        "job_id": "test-job",
+        "ids": ["a"],
+        "source_commit": COMMIT,
+        "benchmark_admissions": 0,
+        "max_replacement_admissions": 1,
+        "raw_assignment_retained": True,
+        "reviewed_pre_exec_failure": True,
+        **{
+            key: selector.binding(path)
+            for key, path in {
+                "launch": failed / "launch.json",
+                "manifest": failed / "manifest.json",
+                "result": result,
+                "eval_log": log,
+                "publisher_status": publisher,
+                "wrapper": wrapper,
+                "smoke": smoke,
+                "closure": closure,
+            }.items()
+        },
+    }
+    path = save(state.root / "preflight-exclusion.json", proof)
+    bind_preflight(state, path)
+    return first, failed, path
+
+
+def bind_preflight(state, path):
+    protocol = json.loads(state.protocol.read_text())
+    protocol["preflight_exclusion"] = selector.binding(path)
+    save(state.protocol, protocol)
+
+
+def test_closed_preflight_keeps_raw_history_and_one_benchmark_replacement(campaign):
+    first, failed, proof = preflight_case(campaign)
+    good = campaign.attempt(
+        "other", [row("d", campaign.config, "I")], ids=["d"], complete=True
+    )
+    ledger = select(
+        campaign,
+        name="after-preflight",
+        preflight_exclusion=proof,
+        infrastructure=diagnose(first, "a"),
+    )
+    a = ledger["samples"][0]
+    assert a["raw_assigned_launches"] == 2 and a["launched_generation_attempts"] == 1
+    assert a["action"] == "retry"
+    assert [r["attempt"] for r in a["attempts"]] == [str(first), str(failed)]
+    assert a["attempts"][1]["counts_toward_generation_budget"] is False
+    assert ledger["samples"][3]["selected"]["score"] == "I"
+    assert ledger["attempts"][str(failed)]["result"] == selector.binding(
+        failed / "result.json"
+    )
+    manifest = json.loads(
+        (campaign.root / "after-preflight/retry/000.json").read_text()
+    )
+    assert manifest["generation_attempt"] == 2
+    assert manifest["retry_of"]["a"]["attempt"] == str(first)
+    replacement = campaign.attempt(
+        "replacement",
+        [row("a", campaign.config, "I")],
+        manifest=manifest,
+        complete=True,
+    )
+    final = select(campaign, name="final", preflight_exclusion=proof)
+    a = final["samples"][0]
+    assert a["raw_assigned_launches"] == 3 and a["launched_generation_attempts"] == 2
+    assert a["action"] == "retain" and a["selected"]["attempt"] == str(replacement)
+    assert final["samples"][3]["selected"]["attempt"] == str(good)
+    campaign.attempt("fourth", manifest=manifest)
+    with pytest.raises(ValueError, match="more than one additional"):
+        select(campaign, name="too-many", preflight_exclusion=proof)
+
+
+def test_another_unadmitted_restart_is_not_automatically_excluded(campaign):
+    first, _, proof = preflight_case(campaign)
+    select(
+        campaign,
+        name="replacement-plan",
+        preflight_exclusion=proof,
+        infrastructure=diagnose(first, "a"),
+    )
+    manifest = json.loads(
+        (campaign.root / "replacement-plan/retry/000.json").read_text()
+    )
+    campaign.attempt("ambiguous-next", manifest=manifest)
+    ledger = select(campaign, name="closed-budget", preflight_exclusion=proof)
+    assert ledger["samples"][0]["action"] == "exhausted"
+    assert ledger["samples"][0]["raw_assigned_launches"] == 3
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "omitted",
+        "unbound",
+        "ids",
+        "review",
+        "marker",
+        "source_changed",
+        "publisher",
+        "closure",
+        "job",
+        "archive",
+        "result_success",
+        "skip_smoke",
+        "multiple",
+    ],
+)
+def test_preflight_exclusion_rejects_ambiguous_or_changed_evidence(campaign, case):
+    first, failed, path = preflight_case(campaign)
+    proof = json.loads(path.read_text())
+    if case == "omitted":
+        with pytest.raises(ValueError, match="explicitly supplied"):
+            select(campaign, name="rejected")
+        return
+    if case == "unbound":
+        proof["ids"] = ["b"]
+        save(path, proof)  # Deliberately do not update protocol binding.
+    else:
+        if case == "ids":
+            proof["ids"] = ["b"]
+        elif case == "review":
+            proof["reviewed_pre_exec_failure"] = False
+        elif case == "marker":
+            (failed / "eval.log").write_text("No archive found; cause unknown.")
+            proof["eval_log"] = selector.binding(failed / "eval.log")
+        elif case == "source_changed":
+            Path(proof["wrapper"]["path"]).write_text("changed")
+        elif case == "publisher":
+            item = json.loads((failed / "checkpoint-status.json").read_text())
+            item["expected"] = 1
+            save(failed / "checkpoint-status.json", item)
+            proof["publisher_status"] = selector.binding(
+                failed / "checkpoint-status.json"
+            )
+        elif case == "closure":
+            item = json.loads(Path(proof["closure"]["path"]).read_text())
+            item["closed"] = False
+            save(Path(proof["closure"]["path"]), item)
+            proof["closure"] = selector.binding(Path(proof["closure"]["path"]))
+        elif case == "job":
+            proof["job_id"] = "other-job"
+        elif case == "archive":
+            (failed / "logs").mkdir()
+            (failed / "logs/unfinalized.eval").write_bytes(b"unfinalized")
+        elif case == "result_success":
+            save(
+                failed / "result.json",
+                {"complete": True, "eval_exit": 0, "publisher_exit": 0},
+            )
+            proof["result"] = selector.binding(failed / "result.json")
+        elif case == "skip_smoke":
+            item = json.loads((failed / "launch.json").read_text())
+            item["command"].insert(2, "--skip-smoke-test")
+            save(failed / "launch.json", item)
+            proof["launch"] = selector.binding(failed / "launch.json")
+        elif case == "multiple":
+            proof = [proof, proof]
+        save(path, proof)
+        bind_preflight(campaign, path)
+    with pytest.raises((ValueError, TypeError)):
+        select(
+            campaign,
+            name="rejected",
+            preflight_exclusion=path,
+            infrastructure=diagnose(first, "a"),
+        )
