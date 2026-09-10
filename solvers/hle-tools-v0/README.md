@@ -87,7 +87,7 @@ to Weka. Run `m2/checkpoint_eval_logs.py` alongside Inspect to copy only validat
 ZIP snapshots to Weka through a temporary file plus atomic rename. A concurrent or
 failed copy can never replace the last valid checkpoint. Stop the helper with
 `SIGTERM` after Inspect exits; it performs one final checkpoint before stopping.
-Resume an interrupted checkpoint with `inspect eval-retry <checkpoint.eval>`.
+Recover interrupted work with finite residual-ID manifests and judge-only repair of saved answers. Preserve every accepted scored answer, including incorrect answers.
 `--no-fail-on-error` continues after bounded sample errors. Reports must retain
 errored samples in the manifest denominator and distinguish an accounted run from
 an all-scored run.
@@ -138,8 +138,13 @@ state is placed on Weka. The custom Inspect backend gives every sample its own
 workspace and persistent Python namespace, removes provider/search credentials,
 blocks network access, and masks `/home` and `/mnt/weka`. Run
 `python solvers/hle-tools-v0/m2/selftest.py` after preparation to verify those
-properties. Cleanup removes the per-job container; `/var/tmp` may be reclaimed
-by the node without affecting evaluation artifacts.
+properties. To reuse a tested prebuilt sandbox that already includes its Python
+dependencies, export `M2_ENROOT_IMAGE` with its `.sqsh` path and
+`M2_ENROOT_IMAGE_SHA256` with its recorded SHA256 before sourcing the helper.
+The helper verifies both the source and node-local image before container
+creation. Use a fresh per-job container for production. Cleanup removes the
+per-job container; `/var/tmp` may be reclaimed by the node without affecting
+evaluation artifacts.
 
 ## HLE-Verified data and manifests
 
@@ -187,7 +192,7 @@ Use 100–200 IDs per shard initially. Each launch uses a new attempt directory;
 a lane lock prevents overlapping drivers.
 
 The configuration declares `task` (`hle_tools`, `hle_direct`, or
-`hle_tools_canary`), `model`, `reasoning_effort`, `concurrency`,
+`hle_tools_canary`), `run_phase` (`production` or `diagnostic`), `model`, `reasoning_effort`, `concurrency`,
 `max_retries`, `timeout`, `attempt_timeout`, `dataset_path`,
 `dataset_revision`, and `judge_model`. Live tools require
 `search_backend: keenable`. For local serving also set `model_base_url`,
@@ -233,3 +238,57 @@ long traces and injected publication failure. Unit tests cover publication,
 tool health, judge retries, strict canaries, recovery, and supervisor failure
 paths. Pin the runtime dependency lock and record the source commit and
 configuration hashes with every launch.
+
+
+## Final aggregation
+
+`m2/aggregate_campaign.py` validates one completed model condition while reading
+one sample at a time. It combines approved retained shards, a completed judge
+repair, and explicitly supplied production attempt results. It verifies source,
+archive, configuration, and protocol hashes; dataset and model settings; recorded
+solver requests; and approved clean production commits. Historical source
+revisions, including recorded dirty state, remain explicit in the provenance.
+Diagnostic configurations are rejected.
+
+```bash
+PYTHONPATH=. python solvers/hle-tools-v0/m2/aggregate_campaign.py \
+  --config "$campaign/configs/gpt-sol-full.json" \
+  --expected-manifest "$campaign/manifests/all.json" \
+  --protocol "$campaign/PROTOCOL.json" \
+  --source-commit <approved-production-commit> \
+  --ledger "$campaign/ledger-v2/gpt-sol/ledger.json" \
+  --judge-result "$campaign/judge-repair/gpt-sol/attempt-1/result.json" \
+  --judge-adoption "$campaign/judge-repair/gpt-sol/adoption-ledger-v2.json" \
+  --attempt <production-shard-attempt/result.json> \
+  --output "$campaign/final/gpt-sol"
+```
+
+Repeat `--attempt` and `--source-commit` as needed. Use the final audited ledger.
+When a later ledger changes other rows but preserves the exact judge-only IDs
+and saved generations, reuse the existing paid repair with an adoption record:
+
+```bash
+PYTHONPATH=. python solvers/hle-tools-v0/m2/aggregate_campaign.py adopt-judge \
+  --ledger "$campaign/ledger-v2/gpt-sol/ledger.json" \
+  --judge-result "$campaign/judge-repair/gpt-sol/attempt-1/result.json" \
+  --output "$campaign/judge-repair/gpt-sol/adoption-ledger-v2.json"
+```
+
+This verifies both ledger/source hashes and the unchanged repaired generations;
+it does not call a model or modify the original repair result. Supply the record
+with `--judge-adoption` during aggregation. A repair already bound to the active
+ledger needs no adoption record. Omit ledger/repair arguments for fresh GLM and
+K2 conditions. For an interrupted archive, `--partial-selection <file.json>`
+requires an explicit JSON object mapping absolute attempt `result.json` paths to
+selected successful IDs. Started/cancelled archives contribute only those rows;
+the index records their original status. Successful partial shards may contribute
+their scored rows while known provider/judge failures must be resolved in another
+supplied attempt. Overlapping scored outcomes are rejected without selecting a
+better answer.
+
+Completion requires exactly one accepted correct or incorrect outcome for every
+expected ID. The new output directory contains `summary.json`, ordered
+`outcomes.jsonl` with row correctness and provenance, and `shards.json` indexing
+native archives and their selected IDs. Token totals, tool counts, and available
+sample elapsed times are recorded without merging long traces into another JSON
+log. Failed validation publishes no completed aggregate.
