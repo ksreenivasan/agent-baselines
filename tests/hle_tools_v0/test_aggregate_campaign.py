@@ -540,3 +540,158 @@ def test_unrepaired_judge_provider_error_is_recorded_without_accepting_a_score(
     with pytest.raises(ValueError, match="missing"):
         aggregate(campaign)
     assert not (campaign.output / "summary.json").exists()
+
+
+def test_metrics_missing_usage_is_distinct_from_recorded_zero():
+    config = configuration(2)
+    missing = aggregator.row_metrics({}, config)
+    zero = aggregator.row_metrics(
+        {"model_usage": {config["model"]: {"input_tokens": 0}}, "events": []},
+        config,
+    )
+    summary = aggregator.summarize_metrics([missing, zero])
+    usage = summary["recorded_usage_by_model"]
+    solver = usage[config["model"]]
+    assert solver["totals"]["input_tokens"] == 0
+    assert solver["totals"]["total_tokens"] is None
+    assert solver["samples_with_usage"] == 1
+    assert solver["samples_without_usage"] == 1
+    assert solver["field_samples_recorded"]["input_tokens"] == 1
+    assert solver["field_samples_missing"]["total_tokens"] == 2
+    assert usage[config["judge_model"]]["samples_without_usage"] == 2
+    assert usage[config["judge_model"]]["totals"]["total_tokens"] is None
+    assert summary["metric_availability"] == {
+        "samples_with_usage": 1,
+        "samples_without_usage": 1,
+        "samples_with_events": 1,
+        "samples_without_events": 1,
+        "samples_without_elapsed_time": 2,
+    }
+    # Legacy sums remain compatible but explicitly have incomplete availability.
+    assert summary["recorded_token_totals"]["total_tokens"] == 0
+
+
+def test_metrics_separate_models_and_preserve_native_token_conventions():
+    config = configuration(1)
+    metrics = aggregator.row_metrics(
+        {
+            "model_usage": {
+                config["model"]: {
+                    "input_tokens": 10,
+                    "output_tokens": 20,
+                    "reasoning_tokens": 15,
+                    "total_tokens": 30,
+                    "input_tokens_cache_read": 4,
+                },
+                config["judge_model"]: {
+                    "input_tokens": 3,
+                    "output_tokens": 2,
+                    "reasoning_tokens": 7,
+                    "total_tokens": 12,
+                },
+            },
+            "events": [
+                {"event": "model", "model": config["model"]},
+                {
+                    "event": "model",
+                    "model": config["judge_model"],
+                    "error": "failed judge request",
+                },
+                {"event": "model", "model": config["judge_model"]},
+                {"event": "model", "model": "other/model", "error": "recorded"},
+            ],
+        },
+        config,
+    )
+    summary = aggregator.summarize_metrics([metrics])
+    assert metrics["tokens"]["total_tokens"] == 42
+    assert summary["recorded_token_totals"]["total_tokens"] == 42
+    assert summary["recorded_usage_by_model"][config["model"]]["totals"] == {
+        "input_tokens": 10,
+        "output_tokens": 20,
+        "reasoning_tokens": 15,
+        "total_tokens": 30,
+        "input_tokens_cache_read": 4,
+    }
+    assert (
+        summary["recorded_usage_by_model"][config["judge_model"]]["totals"][
+            "total_tokens"
+        ]
+        == 12
+    )
+    assert summary["recorded_model_event_totals"] == {
+        "solver": {"events": 1, "errors": 0},
+        "judge": {"events": 2, "errors": 1},
+        "other": {"events": 1, "errors": 1},
+    }
+    assert (
+        summary["recorded_usage_by_model"]["other/model"]["samples_without_usage"] == 1
+    )
+    assert "not all paid attempts" in summary["metrics_scope"]
+    assert "reasoning_tokens is not added" in summary["metrics_scope"]
+
+
+def test_shared_model_identity_does_not_invent_event_roles():
+    config = configuration(1)
+    config["judge_model"] = config["model"]
+    metrics = aggregator.row_metrics(
+        {"events": [{"event": "model", "model": config["model"], "error": "recorded"}]},
+        config,
+    )
+    assert metrics["recorded_model_events"] == {
+        "solver": {"events": 0, "errors": 0},
+        "judge": {"events": 0, "errors": 0},
+        "other": {"events": 1, "errors": 1},
+    }
+
+
+def test_native_limit_and_failed_events_remain_valid_outcomes(campaign):
+    limited = row("a", campaign.config, "I")
+    limited["limit"] = {"type": "time", "limit": 1800}
+    limited["events"][0]["error"] = "AttemptTimeoutError: recorded request timeout"
+    limited["events"].append(
+        {
+            "event": "model",
+            "model": campaign.config["judge_model"],
+            "input": [],
+            "tools": [],
+            "tool_choice": "auto",
+            "config": {"reasoning_effort": "medium"},
+            "output": {},
+        }
+    )
+    limited["model_usage"][campaign.config["judge_model"]] = {
+        "input_tokens": 3,
+        "output_tokens": 2,
+        "total_tokens": 5,
+    }
+    limited["started_at"] = "2026-09-10T00:00:00Z"
+    limited["completed_at"] = "2026-09-10T00:30:00Z"
+    missing = row("b", campaign.config)
+    missing.pop("model_usage")
+    campaign.attempt("native", [limited, missing])
+    summary = aggregate(campaign)
+    outcomes = [
+        json.loads(line)
+        for line in (campaign.output / "outcomes.jsonl").read_text().splitlines()
+    ]
+    assert summary["complete"] and summary["correct"] == summary["incorrect"] == 1
+    assert outcomes[0]["limit"] == {"type": "time", "limit": 1800.0}
+    assert outcomes[0]["correct"] is False
+    assert summary["samples_with_recorded_limit"] == 1
+    assert summary["limit_type_counts"] == {"time": 1}
+    assert summary["recorded_model_event_totals"]["solver"] == {
+        "events": 2,
+        "errors": 1,
+    }
+    assert summary["recorded_model_event_totals"]["judge"] == {"events": 1, "errors": 0}
+    assert (
+        summary["recorded_usage_by_model"][campaign.config["model"]][
+            "samples_without_usage"
+        ]
+        == 1
+    )
+    assert summary["sum_sample_elapsed_seconds"] == 1800
+    assert summary["samples_with_elapsed_time"] == 1
+    assert summary["metric_availability"]["samples_without_elapsed_time"] == 1
+    assert "Not campaign wall time" in summary["duration_scope"]

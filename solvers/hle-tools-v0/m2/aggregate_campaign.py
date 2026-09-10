@@ -393,16 +393,53 @@ def sources(
     return inputs, approvals, provenance
 
 
-def row_metrics(row: dict) -> dict:
+TOKEN_FIELDS = ("input_tokens", "output_tokens", "total_tokens", "reasoning_tokens")
+
+
+def row_metrics(row: dict, config: dict | None = None) -> dict:
+    config = config or {}
+    events = row.get("events") or []
     tools = Counter(
         event.get("function", "unknown")
-        for event in row.get("events", [])
+        for event in events
         if event.get("event") == "tool"
     )
-    usage = row.get("model_usage", {})
+    raw_usage = row.get("model_usage") or {}
+    usage = {
+        model: {
+            key: value
+            for key, value in fields.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+        for model, fields in raw_usage.items()
+        if isinstance(fields, dict)
+    }
+    solver = config.get("model") or row.get("output", {}).get("model")
+    judge = config.get("judge_model")
+    models = set(usage) | {model for model in (solver, judge) if model}
+    models.update(
+        event["model"]
+        for event in events
+        if event.get("event") == "model" and event.get("model")
+    )
+    recorded_events = {
+        role: {"events": 0, "errors": 0} for role in ("solver", "judge", "other")
+    }
+    for event in events:
+        if event.get("event") != "model":
+            continue
+        model = event.get("model")
+        # Shared or unknown model identities do not establish a solver/judge role.
+        role = (
+            "solver"
+            if model == solver and solver != judge
+            else "judge" if model == judge and judge != solver else "other"
+        )
+        recorded_events[role]["events"] += 1
+        recorded_events[role]["errors"] += bool(event.get("error"))
     tokens = {
-        key: sum(value.get(key, 0) or 0 for value in usage.values())
-        for key in ("input_tokens", "output_tokens", "total_tokens")
+        key: sum(fields.get(key, 0) for fields in usage.values())
+        for key in TOKEN_FIELDS[:3]
     }
     elapsed = None
     if row.get("started_at") and row.get("completed_at"):
@@ -410,7 +447,112 @@ def row_metrics(row: dict) -> dict:
             datetime.fromisoformat(row["completed_at"].replace("Z", "+00:00"))
             - datetime.fromisoformat(row["started_at"].replace("Z", "+00:00"))
         ).total_seconds()
-    return {"tool_calls": dict(tools), "tokens": tokens, "elapsed_seconds": elapsed}
+    return {
+        "tool_calls": dict(tools),
+        "tokens": tokens,
+        "elapsed_seconds": elapsed,
+        "usage_by_model": {model: usage.get(model, {}) for model in sorted(models)},
+        "usage_models_recorded": sorted(usage),
+        "events_available": isinstance(row.get("events"), list),
+        "recorded_model_events": recorded_events,
+        "recorded_tool_event_errors": sum(
+            bool(event.get("error")) for event in events if event.get("event") == "tool"
+        ),
+        "limit": row.get("limit"),
+    }
+
+
+def summarize_metrics(outcomes: list[dict]) -> dict:
+    count = len(outcomes)
+    models = sorted({model for row in outcomes for model in row["usage_by_model"]})
+    usage_by_model = {}
+    for model in models:
+        fields = sorted(
+            set(TOKEN_FIELDS)
+            | {
+                field
+                for row in outcomes
+                for field in row["usage_by_model"].get(model, {})
+            }
+        )
+        recorded = {
+            field: sum(
+                field in row["usage_by_model"].get(model, {}) for row in outcomes
+            )
+            for field in fields
+        }
+        with_usage = sum(model in row["usage_models_recorded"] for row in outcomes)
+        usage_by_model[model] = {
+            "totals": {
+                field: (
+                    sum(
+                        row["usage_by_model"].get(model, {}).get(field, 0)
+                        for row in outcomes
+                    )
+                    if recorded[field]
+                    else None
+                )
+                for field in fields
+            },
+            "samples_with_usage": with_usage,
+            "samples_without_usage": count - with_usage,
+            "field_samples_recorded": recorded,
+            "field_samples_missing": {
+                field: count - n for field, n in recorded.items()
+            },
+        }
+    tool_totals: Counter[str] = Counter()
+    token_totals: Counter[str] = Counter()
+    event_totals = {
+        role: {"events": 0, "errors": 0} for role in ("solver", "judge", "other")
+    }
+    durations = []
+    for row in outcomes:
+        tool_totals.update(row["tool_calls"])
+        token_totals.update(row["tokens"])
+        if row["elapsed_seconds"] is not None:
+            durations.append(row["elapsed_seconds"])
+        for role, values in row["recorded_model_events"].items():
+            for key, value in values.items():
+                event_totals[role][key] += value
+    with_usage = sum(bool(row["usage_models_recorded"]) for row in outcomes)
+    with_events = sum(row["events_available"] for row in outcomes)
+    limits = [row["limit"] for row in outcomes if row["limit"] is not None]
+    return {
+        "tool_call_totals": dict(tool_totals),
+        "recorded_token_totals": dict(token_totals),
+        "sum_sample_elapsed_seconds": sum(durations),
+        "samples_with_elapsed_time": len(durations),
+        "recorded_usage_by_model": usage_by_model,
+        "metric_availability": {
+            "samples_with_usage": with_usage,
+            "samples_without_usage": count - with_usage,
+            "samples_with_events": with_events,
+            "samples_without_events": count - with_events,
+            "samples_without_elapsed_time": count - len(durations),
+        },
+        "recorded_model_event_totals": event_totals,
+        "recorded_tool_event_errors": sum(
+            row["recorded_tool_event_errors"] for row in outcomes
+        ),
+        "samples_with_recorded_limit": len(limits),
+        "limit_type_counts": dict(
+            Counter(limit.get("type", "unknown") for limit in limits)
+        ),
+        "metrics_scope": (
+            "Selected native outcomes only; not all paid attempts or billed cost. "
+            "Model-event roles use distinct configured model identities; shared or unknown identities are other. "
+            "Event errors count recorded failed events, not inferred transport retries. "
+            "Usage availability means fields present in native samples; upstream defaults cannot be distinguished. "
+            "Legacy token totals sum observed fields across models; consult availability counts. "
+            "Native total_tokens is preserved; reasoning_tokens is not added to it."
+        ),
+        "duration_scope": (
+            "Sum of selected native sample started_at-to-completed_at intervals, which may overlap. "
+            "Not campaign wall time or total attempt latency. Saved-answer repairs may retain original sample timestamps. "
+            "Recorded limits are reported separately; missing timestamps are excluded."
+        ),
+    }
 
 
 def aggregate(
@@ -582,7 +724,7 @@ def aggregate(
                 "archive_sha256": entry["sha256"],
                 "kind": entry["kind"],
                 "generation_sha256": generation,
-                **row_metrics(row),
+                **row_metrics(row, config),
             }
             accepted.append(sample_id)
         required = set(explicit) if explicit is not None else set(entry["ids"])
@@ -608,22 +750,11 @@ def aggregate(
         f"condition is unresolved: {len(missing)} missing outcomes",
     )
     correct = sum(row["correct"] for row in outcomes.values())
-    tool_totals: Counter[str] = Counter()
-    token_totals: Counter[str] = Counter()
-    durations = []
-    for outcome in outcomes.values():
-        tool_totals.update(outcome["tool_calls"])
-        token_totals.update(outcome["tokens"])
-        if outcome["elapsed_seconds"] is not None:
-            durations.append(outcome["elapsed_seconds"])
     summary = {
         "version": 1,
         "complete": True,
         "configuration": config,
-        "tool_call_totals": dict(tool_totals),
-        "recorded_token_totals": dict(token_totals),
-        "sum_sample_elapsed_seconds": sum(durations),
-        "samples_with_elapsed_time": len(durations),
+        **summarize_metrics(list(outcomes.values())),
         "model": config["model"],
         "dataset_revision": config["dataset_revision"],
         "dataset_ids_sha256": digest(ids),
