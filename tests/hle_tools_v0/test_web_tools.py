@@ -576,3 +576,311 @@ def test_historical_403_search_error_is_not_reinterpreted(payload):
         ],
     }
     assert disposition(historical) == ("generate", "web_backend_error")
+
+
+@pytest.fixture
+def fake_keenable_http(monkeypatch, tmp_path):
+    def configure(outcomes, *, patch_state=True, close_cancel=False):
+        requests, delays = [], []
+        pending = list(outcomes)
+        state = SimpleNamespace(sample_id="sample-retry", epoch=1, metadata={})
+        original_sleep = asyncio.sleep
+
+        class Client:
+            def __init__(self, **kwargs):
+                assert kwargs == {"timeout": 30}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                if close_cancel:
+                    raise asyncio.CancelledError()
+                return False
+
+            async def post(self, url, **kwargs):
+                requests.append({"url": url, **kwargs})
+                assert pending, "more than the planned HTTP attempts"
+                outcome = pending.pop(0)
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                if outcome == "wait":
+                    await asyncio.Event().wait()
+                response = httpx.Response(
+                    outcome,
+                    json=(
+                        {"results": []}
+                        if outcome == 200
+                        else {"error": "synthetic-key", "message": "private-query"}
+                    ),
+                    headers={"x-request-id": "request-safe"},
+                    request=httpx.Request("POST", url),
+                )
+                return response
+
+        async def sleep(delay):
+            assert delay == 2
+            delays.append(delay)
+            await original_sleep(0)
+
+        monkeypatch.setenv("HLE_SEARCH_BACKEND", "keenable")
+        monkeypatch.setenv("KEENABLE_API_KEY", "synthetic-key")
+        monkeypatch.setenv("HLE_TOOL_GUARD_DIR", str(tmp_path / "guard"))
+        monkeypatch.setattr(module.httpx, "AsyncClient", Client)
+        monkeypatch.setattr(module.asyncio, "sleep", sleep)
+        if patch_state:
+            monkeypatch.setattr(module, "sample_state", lambda: state)
+        return SimpleNamespace(
+            state=state, requests=requests, delays=delays, guard=tmp_path / "guard"
+        )
+
+    return configure
+
+
+@pytest.mark.parametrize("initial", [500, 429])
+def test_transient_retry_success_uses_identical_request_without_invalidation(
+    fake_keenable_http, initial
+):
+    fixture = fake_keenable_http([initial, 200])
+    module._search_failures["keenable"] = 2
+    assert asyncio.run(web_search()(query="private-query", max_results=7)) == []
+    assert (
+        fixture.requests
+        == [
+            {
+                "url": "https://api.keenable.ai/v1/search",
+                "headers": {"X-API-Key": "synthetic-key"},
+                "json": {"query": "private-query", "max_results": 7, "mode": "pro"},
+            }
+        ]
+        * 2
+    )
+    assert fixture.delays == [2]
+    assert module._search_failures["keenable"] == 0
+    assert "hle_tools_invalidated" not in fixture.state.metadata
+    assert not (fixture.guard / "events.jsonl").exists()
+    assert not (fixture.guard / "fatal.json").exists()
+    events = fixture.state.metadata["hle_tools_search_transport_attempts"]
+    assert [event["attempt"] for event in events] == [1, 2]
+    assert [event["terminal"] for event in events] == [False, True]
+    assert [event["http_diagnostics"]["status"] for event in events] == [initial, 200]
+    assert events[0]["retry_id"] == events[1]["retry_id"]
+    sidecar = (fixture.guard / "transport-attempts.jsonl").read_text()
+    assert [json.loads(line) for line in sidecar.splitlines()] == events
+    assert "synthetic-key" not in sidecar and "private-query" not in sidecar
+    assert set(events[0]["http_diagnostics"]) == {"status", "body_sha256", "request_id"}
+
+
+@pytest.mark.parametrize(
+    "initial,final", [(500, 500), (500, 429), (429, 500), (429, 429)]
+)
+def test_retry_exhaustion_invalidates_once_and_never_makes_a_third_request(
+    fake_keenable_http, initial, final
+):
+    fixture = fake_keenable_http([initial, final])
+    result = asyncio.run(web_search()(query="safe query"))
+    assert result == {"backend": "keenable", "error": f"search_http_{final}"}
+    assert len(fixture.requests) == 2 and fixture.delays == [2]
+    assert fixture.state.metadata["hle_tools_invalidated"] is True
+    assert len(fixture.state.metadata["hle_tools_infrastructure_errors"]) == 1
+    assert module._search_failures["keenable"] == 1
+    assert not (fixture.guard / "fatal.json").exists()
+    assert len(fixture.state.metadata["hle_tools_search_transport_attempts"]) == 2
+
+
+@pytest.mark.parametrize("status", [401, 402, 403, 404, 422, 502, 503, 504])
+def test_no_new_retry_for_auth_content_or_other_5xx(fake_keenable_http, status):
+    fixture = fake_keenable_http([status])
+    result = asyncio.run(web_search()(query="safe query"))
+    assert result["error"] == f"search_http_{status}"
+    assert len(fixture.requests) == 1 and not fixture.delays
+    assert "hle_tools_search_transport_attempts" not in fixture.state.metadata
+    assert fixture.state.metadata["hle_tools_invalidated"] is True
+    assert (fixture.guard / "fatal.json").exists() is (status in {401, 402, 403})
+
+
+@pytest.mark.parametrize(
+    "error,expected",
+    [
+        (httpx.ReadTimeout("private-query synthetic-key"), "search_timeout"),
+        (httpx.ConnectError("private-query synthetic-key"), "search_transport_error"),
+    ],
+)
+def test_retry_final_transport_exception_keeps_evidence_and_existing_error(
+    fake_keenable_http, error, expected
+):
+    fixture = fake_keenable_http([500, error])
+    assert asyncio.run(web_search()(query="safe query"))["error"] == expected
+    assert len(fixture.requests) == 2
+    events = fixture.state.metadata["hle_tools_search_transport_attempts"]
+    assert events[-1]["exception_type"] == type(error).__name__
+    assert events[-1]["terminal"] is True
+    assert fixture.state.metadata["hle_tools_invalidated"] is True
+    sidecar = (fixture.guard / "transport-attempts.jsonl").read_text()
+    assert "private-query" not in sidecar and "synthetic-key" not in sidecar
+
+
+@pytest.mark.parametrize("initial", [500, 429])
+@pytest.mark.parametrize("phase", ["backoff", "request"])
+def test_cancellation_is_reraised_and_only_unrecovered_500_invalidates(
+    monkeypatch, fake_keenable_http, initial, phase
+):
+    fixture = fake_keenable_http([initial, asyncio.CancelledError()])
+    if phase == "backoff":
+
+        async def cancel(delay):
+            assert delay == 2
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(module.asyncio, "sleep", cancel)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(web_search()(query="safe query"))
+    assert len(fixture.requests) == (1 if phase == "backoff" else 2)
+    events = fixture.state.metadata["hle_tools_search_transport_attempts"]
+    assert events[-1]["exception_type"] == "CancelledError"
+    assert events[-1]["phase"] == phase
+    assert events[-1]["terminal"] is True
+    assert bool(fixture.state.metadata.get("hle_tools_invalidated")) is (initial == 500)
+    if initial == 500:
+        invalidation = fixture.state.metadata["hle_tools_infrastructure_errors"][0]
+        assert invalidation["error"] == "search_retry_cancelled"
+        assert invalidation["http_diagnostics"] == events[0]["http_diagnostics"]
+        assert invalidation["http_diagnostics"]["status"] == 500
+        assert json.loads((fixture.guard / "events.jsonl").read_text()) == invalidation
+    else:
+        assert not (fixture.guard / "events.jsonl").exists()
+
+
+def test_first_request_cancellation_is_unchanged(fake_keenable_http):
+    fixture = fake_keenable_http([asyncio.CancelledError()])
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(web_search()(query="safe query"))
+    assert len(fixture.requests) == 1 and fixture.state.metadata == {}
+    assert not fixture.guard.exists()
+
+
+def test_existing_deadline_cancels_retry_without_a_new_timeout_policy(
+    fake_keenable_http,
+):
+    fixture = fake_keenable_http([500, "wait"])
+
+    async def deadline():
+        await asyncio.wait_for(web_search()(query="safe query"), timeout=0.02)
+
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(deadline())
+    assert len(fixture.requests) == 2
+    assert fixture.state.metadata["hle_tools_invalidated"] is True
+    assert (
+        fixture.state.metadata["hle_tools_search_transport_attempts"][-1][
+            "exception_type"
+        ]
+        == "CancelledError"
+    )
+
+
+def test_recovered_500_preserves_prior_invalidation(fake_keenable_http):
+    fixture = fake_keenable_http([500, 200])
+    prior = {"error": "search_http_500"}
+    fixture.state.metadata.update(
+        hle_tools_invalidated=True, hle_tools_infrastructure_errors=[prior]
+    )
+    assert asyncio.run(web_search()(query="safe query")) == []
+    assert fixture.state.metadata["hle_tools_invalidated"] is True
+    assert fixture.state.metadata["hle_tools_infrastructure_errors"] == [prior]
+
+
+@pytest.mark.parametrize("final,expected", [(200, "retain_score"), (500, "generate")])
+def test_native_retry_evidence_and_acceptance_round_trip(
+    monkeypatch, fake_keenable_http, tmp_path, final, expected
+):
+    from inspect_ai import Task, eval
+    from inspect_ai.dataset import Sample
+    from inspect_ai.model import ChatMessageAssistant, ModelOutput, execute_tools
+    from inspect_ai.scorer import Score, scorer
+    from inspect_ai.solver import solver
+    from inspect_ai.tool import ToolCall
+
+    # Keep Inspect's own asyncio scheduling intact; two real seconds is bounded.
+    original_sleep = asyncio.sleep
+    fixture = fake_keenable_http([500, final], patch_state=False)
+    monkeypatch.setattr(module.asyncio, "sleep", original_sleep)
+
+    @solver
+    def exercise_retry():
+        async def solve(state, generate):
+            await execute_tools(
+                [
+                    ChatMessageAssistant(
+                        content="",
+                        tool_calls=[
+                            ToolCall(
+                                id="retry-search",
+                                function="web_search",
+                                arguments={"query": "safe query"},
+                            )
+                        ],
+                    )
+                ],
+                [web_search()],
+            )
+            state.output = ModelOutput.from_content("mockllm/model", "answer")
+            return state
+
+        return solve
+
+    @scorer(metrics=[])
+    def hle_scorer():
+        async def score(state, target):
+            return Score(value="I")
+
+        return score
+
+    eval(
+        Task(
+            dataset=[Sample(id="native-retry", input="question", target="answer")],
+            solver=exercise_retry(),
+            scorer=hle_scorer(),
+        ),
+        model="mockllm/model",
+        display="none",
+        log_dir=str(tmp_path / "logs"),
+    )
+    row = next(iter_samples(next((tmp_path / "logs").glob("*.eval"))))
+    assert disposition(row)[0] == expected
+    assert row["scores"]["hle_scorer"]["value"] == "I"
+    events = row["metadata"]["hle_tools_search_transport_attempts"]
+    assert [e["http_diagnostics"]["status"] for e in events] == [500, final]
+    assert all(e["sample_id"] == "native-retry" for e in events)
+    assert events == [
+        json.loads(line)
+        for line in (fixture.guard / "transport-attempts.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert len([e for e in row["events"] if e["event"] == "tool"]) == 1
+
+
+@pytest.mark.parametrize(
+    "outcomes,invalidated",
+    [([500, 500], True), ([500, 200], False), ([429, 429], False), ([200], False)],
+)
+def test_client_close_cancellation_after_unrecovered_500_is_not_lost(
+    fake_keenable_http, outcomes, invalidated
+):
+    fixture = fake_keenable_http(outcomes, close_cancel=True)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(web_search()(query="safe query"))
+    assert len(fixture.requests) == len(outcomes)
+    assert bool(fixture.state.metadata.get("hle_tools_invalidated")) is invalidated
+    if len(outcomes) == 2:
+        events = fixture.state.metadata["hle_tools_search_transport_attempts"]
+        assert events[-1]["phase"] == "client_close"
+        assert events[-1]["exception_type"] == "CancelledError"
+        if invalidated:
+            invalidation = fixture.state.metadata["hle_tools_infrastructure_errors"][0]
+            assert invalidation["http_diagnostics"] == events[-2]["http_diagnostics"]
+            assert invalidation["http_diagnostics"]["status"] == 500
+            assert (
+                json.loads((fixture.guard / "events.jsonl").read_text()) == invalidation
+            )

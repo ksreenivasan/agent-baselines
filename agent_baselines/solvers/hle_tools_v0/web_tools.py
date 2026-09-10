@@ -9,6 +9,7 @@ import time
 from contextvars import ContextVar
 from pathlib import Path
 from urllib.parse import urlparse
+from uuid import uuid4
 
 import httpx
 from inspect_ai.solver._task_state import sample_state
@@ -122,6 +123,53 @@ def _http_error_diagnostics(
     return details
 
 
+def _search_transport_event(
+    retry_id: str,
+    attempt: int,
+    *,
+    terminal: bool,
+    phase: str = "request",
+    response: httpx.Response | None = None,
+    exception: BaseException | None = None,
+) -> None:
+    """Record bounded retry evidence separately from sample invalidation."""
+    state = sample_state()
+    event: dict[str, object] = {
+        "time": time.time(),
+        "backend": "keenable",
+        "retry_id": retry_id,
+        "attempt": attempt,
+        "max_attempts": 2,
+        "phase": phase,
+        "terminal": terminal,
+        "sample_id": state.sample_id if state else None,
+        "epoch": state.epoch if state else None,
+    }
+    if response is not None:
+        diagnostics = _http_error_diagnostics("keenable", response)
+        event["http_diagnostics"] = {
+            key: diagnostics[key]
+            for key in ("status", "body_sha256", "request_id")
+            if key in diagnostics
+        }
+    if exception is not None:
+        # Exception messages can contain headers or queries; retain only the type.
+        event["exception_type"] = type(exception).__name__
+    if state is not None:
+        state.metadata.setdefault("hle_tools_search_transport_attempts", []).append(
+            event
+        )
+    guard_dir = os.environ.get("HLE_TOOL_GUARD_DIR")
+    if guard_dir:
+        directory = Path(guard_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        # No await: concurrent coroutines cannot interleave these bounded writes.
+        with (directory / "transport-attempts.jsonl").open("a") as stream:
+            stream.write(json.dumps(event, sort_keys=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+
+
 def _keenable_content_error(response: httpx.Response) -> dict[str, str | int] | None:
     known = {
         403: (
@@ -233,17 +281,67 @@ async def _keenable_search(query: str, max_results: int) -> list[dict[str, str |
     key = os.environ.get("KEENABLE_API_KEY")
     if not key:
         raise RuntimeError("KEENABLE_API_KEY is unavailable; live search is blocked")
-    async with httpx.AsyncClient(timeout=30) as client:
-        for attempt in range(2):
-            response = await client.post(
-                "https://api.keenable.ai/v1/search",
-                headers={"X-API-Key": key},
-                json={"query": query, "max_results": max_results, "mode": "pro"},
+    retry_id = None
+    unrecovered_500 = False
+    last_500_diagnostics: dict[str, str | int] | None = None
+    attempt_number = 0
+    phase = "client_open"
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            for attempt in range(2):
+                attempt_number = attempt + 1
+                phase = "request"
+                try:
+                    response = await client.post(
+                        "https://api.keenable.ai/v1/search",
+                        headers={"X-API-Key": key},
+                        json={
+                            "query": query,
+                            "max_results": max_results,
+                            "mode": "pro",
+                        },
+                    )
+                except httpx.HTTPError as error:
+                    if retry_id is not None:
+                        _search_transport_event(
+                            retry_id, attempt_number, terminal=True, exception=error
+                        )
+                    phase = "client_close"
+                    raise
+                if response.status_code == 500:
+                    unrecovered_500 = True
+                    diagnostics = _http_error_diagnostics("keenable", response)
+                    last_500_diagnostics = {
+                        key: diagnostics[key]
+                        for key in ("status", "body_sha256", "request_id")
+                        if key in diagnostics
+                    }
+                elif response.is_success:
+                    unrecovered_500 = False
+                if retry_id is not None:
+                    _search_transport_event(
+                        retry_id, attempt_number, terminal=True, response=response
+                    )
+                if response.status_code not in {429, 500} or attempt == 1:
+                    break
+                retry_id = uuid4().hex
+                _search_transport_event(retry_id, 1, terminal=False, response=response)
+                phase = "backoff"
+                await asyncio.sleep(2)
+            phase = "client_close"
+            response.raise_for_status()
+    except asyncio.CancelledError as error:
+        if retry_id is not None:
+            _search_transport_event(
+                retry_id, attempt_number, terminal=True, phase=phase, exception=error
             )
-            if response.status_code != 429 or attempt == 1:
-                break
-            await asyncio.sleep(2)
-        response.raise_for_status()
+        if unrecovered_500:
+            _search_health(
+                "keenable",
+                "search_retry_cancelled",
+                http_diagnostics=last_500_diagnostics,
+            )
+        raise
     results = []
     for rank, item in enumerate(response.json().get("results", []), start=1):
         url = str(item.get("url", ""))
