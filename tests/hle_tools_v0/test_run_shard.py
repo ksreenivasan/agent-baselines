@@ -253,7 +253,7 @@ def supervisor(monkeypatch, tmp_path):
         assert all(process.poll() is not None for process in state.processes)
         if state.final_timeout:
             raise subprocess.TimeoutExpired(command, kwargs["timeout"])
-        write_archive(output / "logs" / "one.eval", **state.header)
+        write_archive(state.output / "logs" / "one.eval", **state.header)
         return SimpleNamespace(returncode=state.final_exit)
 
     monkeypatch.setattr(
@@ -281,6 +281,9 @@ def test_supervisor_success_requires_durable_validated_output(supervisor):
     assert runner.main() == 0
     saved = result(supervisor)
     assert saved["complete"] and saved["validation"]["valid"]
+    from agent_baselines.evals.hle_tools_v0.recovery import file_digest
+
+    assert saved["archive_sha256"] == file_digest(Path(saved["archive"]))
     assert supervisor.final_calls == 1
 
 
@@ -503,3 +506,14 @@ def test_lane_continues_residuals_but_stops_infrastructure_failures(
         f"{index:04}.json" for index in range(executed)
     ]
     assert (output / "driver-offline-lane-test.log").exists()
+
+
+def test_distinct_phase_outputs_cannot_share_node_local_scratch(supervisor, tmp_path):
+    local_roots = []
+    for phase in ("canary", "pilot"):
+        supervisor.output = tmp_path / phase / "same-lane" / "same-attempt"
+        sys.argv[sys.argv.index("--output") + 1] = str(supervisor.output)
+        assert runner.main() == 0
+        local_roots.append(result(supervisor)["local_root"])
+    assert local_roots[0] != local_roots[1]
+    assert all(Path(root).exists() for root in local_roots)

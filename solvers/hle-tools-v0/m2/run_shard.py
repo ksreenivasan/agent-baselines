@@ -222,7 +222,10 @@ def main() -> int:
     local = (
         scratch
         / f"hle-resume-{os.getuid()}-{os.environ['SLURM_JOB_ID']}"
-        / f"{args.output.parent.name}-{args.output.name}"
+        / (
+            f"{args.output.parent.name}-{args.output.name}-"
+            f"{hashlib.sha256(str(args.output.resolve()).encode()).hexdigest()[:12]}"
+        )
     )
     local.mkdir(parents=True, exist_ok=False)
     live = local / "logs"
@@ -342,8 +345,11 @@ def main() -> int:
                 result["reason"] or "expected exactly one durable archive"
             )
         elif final_pub.returncode == 0:
+            from agent_baselines.evals.hle_tools_v0.recovery import file_digest
+
             result["archive"] = str(paths[0])
             result["validation"] = validate_archive(paths[0], expected)
+            result["archive_sha256"] = file_digest(paths[0])
         complete = (
             not result["reason"]
             and eval_rc == 0
