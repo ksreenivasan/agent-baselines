@@ -386,6 +386,73 @@ def verify_retry(
             )
 
 
+def verify_initial_selection(
+    record: dict,
+    attempts: dict,
+    config: dict,
+    expected_manifest: dict,
+) -> None:
+    reference = record["selection_ledger"]
+    require(
+        isinstance(reference, dict),
+        "initial selection has no immutable ledger binding",
+    )
+    ledger = read_json(checked_file(reference["path"], reference["sha256"]))
+    require(
+        ledger.get("config") == config
+        and ledger.get("expected_manifest") == expected_manifest
+        and ledger.get("max_additional_generation_attempts") == 1,
+        "initial selection ledger configuration, manifest or attempt cap differs",
+    )
+    for sample_id in record["ids"]:
+        entries = [row for row in ledger.get("samples", []) if row["id"] == sample_id]
+        require(
+            len(entries) == 1
+            and entries[0].get("action") == "unlaunched"
+            and entries[0].get("raw_assigned_launches") == 0
+            and entries[0].get("launched_generation_attempts") == 0
+            and entries[0].get("attempts") == []
+            and "selected" not in entries[0]
+            and "diagnosis" not in entries[0],
+            "initial selection ledger does not prove an unlaunched sample",
+        )
+    prior_attempts = ledger.get("attempts")
+    require(isinstance(prior_attempts, dict), "initial selection ledger has no history")
+    for directory, prior in prior_attempts.items():
+        actual = attempts.get(directory)
+        require(actual is not None, "initial selection ledger prior attempt is missing")
+        assert actual is not None
+        require(
+            actual["started_at"] < record["started_at"],
+            "initial selection ledger contains a non-prior attempt",
+        )
+        for key in (
+            "attempt",
+            "launch",
+            "manifest",
+            "ids",
+            "started_at",
+            "source_commit",
+            "generation_attempt",
+            "retry_of",
+            "selection_ledger",
+        ):
+            require(
+                key in prior and prior[key] == actual.get(key),
+                f"initial selection ledger prior {key} differs",
+            )
+        require(
+            not set(prior["ids"]) & set(record["ids"]),
+            "initial selection ledger contains a prior sample assignment",
+        )
+        for key in ("result", "archive"):
+            if key in prior:
+                require(
+                    prior[key] == actual.get(key),
+                    f"initial selection ledger prior {key} checksum differs",
+                )
+
+
 def select(
     config_path: Path,
     expected_path: Path,
@@ -448,6 +515,11 @@ def select(
     exclusion = read_preflight_exclusion(
         preflight_exclusion, protocol, attempts, outcomes
     )
+    for record in attempts.values():
+        if record["generation_attempt"] == 1 and record["selection_ledger"] is not None:
+            verify_initial_selection(
+                record, attempts, binding(config_path), binding(expected_path)
+            )
     decisions: list[dict[str, Any]] = []
     for sample_id in ids:
         assigned = sorted(
@@ -465,9 +537,7 @@ def select(
         )
         if launched:
             require(
-                not launched[0]["retry_of"]
-                and not launched[0]["selection_ledger"]
-                and launched[0]["generation_attempt"] == 1,
+                not launched[0]["retry_of"] and launched[0]["generation_attempt"] == 1,
                 "retry requires its initial attempt record",
             )
         for record in assigned[1:]:

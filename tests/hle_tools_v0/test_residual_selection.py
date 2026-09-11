@@ -708,3 +708,177 @@ def test_preflight_exclusion_rejects_ambiguous_or_changed_evidence(campaign, cas
             preflight_exclusion=path,
             infrastructure=diagnose(first, "a"),
         )
+
+
+def initial_manifest(state, ledger_path, ids):
+    return {
+        "ids": ids,
+        "dataset_revision": state.config["dataset_revision"],
+        "dataset_variant": "standard",
+        "generation_attempt": 1,
+        "selection_ledger": selector.binding(ledger_path),
+    }
+
+
+@pytest.mark.parametrize(
+    "outcome", ["launch_only", "unfinalized_archive", "complete", "partial"]
+)
+def test_ledger_bound_initial_generation_preserves_prior_scores_and_budget(
+    campaign, outcome
+):
+    campaign.attempt(
+        "prior", [row("a", campaign.config, "I")], ids=["a"], complete=True
+    )
+    prior = select(campaign, name="prior-selection")
+    manifest = initial_manifest(
+        campaign, campaign.root / "prior-selection/ledger.json", ["b", "c"]
+    )
+    fresh = campaign.attempt(
+        "fresh",
+        (
+            None
+            if outcome == "launch_only"
+            else [row("b", campaign.config, "I"), row("c", campaign.config, "C")]
+        ),
+        manifest=manifest,
+        complete=outcome == "complete",
+    )
+    if outcome == "unfinalized_archive":
+        (fresh / "result.json").unlink()
+    original_manifest = (fresh / "manifest.json").read_bytes()
+    kwargs = {"partial": {str(fresh): ["b"]}} if outcome == "partial" else {}
+    final = select(campaign, **kwargs)
+    entries = {item["id"]: item for item in final["samples"]}
+    assert entries["a"]["selected"] == prior["samples"][0]["selected"]
+    assert entries["d"]["action"] == "unlaunched"
+    assert (fresh / "manifest.json").read_bytes() == original_manifest
+    for sample_id in ["b", "c"]:
+        entry = entries[sample_id]
+        assert entry["raw_assigned_launches"] == 1
+        assert entry["launched_generation_attempts"] == 1
+        if outcome == "complete" or (outcome == "partial" and sample_id == "b"):
+            assert entry["action"] == "retain"
+        elif outcome == "partial":
+            assert entry["action"] == "partial_selection_required"
+        else:
+            assert entry["action"] == "held"
+        assert entry["action"] not in {"unlaunched", "retry"}
+    assert not (campaign.root / "selection/retry").exists()
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "config",
+        "expected_manifest",
+        "attempt_cap",
+        "action",
+        "raw_assignment",
+        "admitted_assignment",
+        "history",
+        "selected",
+        "diagnosis",
+        "missing_entry",
+        "duplicate_entry",
+        "missing_history",
+        "missing_prior",
+        "prior_manifest",
+        "prior_result",
+        "prior_ids",
+        "non_prior",
+        "tampered",
+        "missing_file",
+        "retry_of",
+    ],
+)
+def test_ledger_bound_initial_generation_rejects_contaminated_proof(campaign, case):
+    previous = campaign.attempt(
+        "prior", [row("a", campaign.config, "I")], ids=["a"], complete=True
+    )
+    ledger = select(campaign, name="prior-selection")
+    path = campaign.root / "prior-selection/ledger.json"
+    entry = ledger["samples"][1]
+    if case == "config":
+        ledger["config"]["sha256"] = "different"
+    elif case == "expected_manifest":
+        ledger["expected_manifest"]["sha256"] = "different"
+    elif case == "attempt_cap":
+        ledger["max_additional_generation_attempts"] = 2
+    elif case == "action":
+        entry["action"] = "retain"
+    elif case == "raw_assignment":
+        entry["raw_assigned_launches"] = 1
+    elif case == "admitted_assignment":
+        entry["launched_generation_attempts"] = 1
+    elif case == "history":
+        entry["attempts"] = [{"attempt": str(previous)}]
+    elif case == "selected":
+        entry["selected"] = {}
+    elif case == "diagnosis":
+        entry["diagnosis"] = diagnose(previous, "b")["b"]
+    elif case == "missing_entry":
+        ledger["samples"].remove(entry)
+    elif case == "duplicate_entry":
+        ledger["samples"].append(entry)
+    elif case == "missing_history":
+        del ledger["attempts"]
+    elif case == "missing_prior":
+        campaign.attempts.remove(previous)
+    elif case in {"prior_manifest", "prior_result"}:
+        ledger["attempts"][str(previous)][case.removeprefix("prior_")][
+            "sha256"
+        ] = "different"
+    elif case == "prior_ids":
+        ledger["attempts"][str(previous)]["ids"] = ["a", "b"]
+    save(path, ledger)
+    manifest = initial_manifest(campaign, path, ["b"])
+    if case == "retry_of":
+        manifest["retry_of"] = {"b": {"attempt": str(previous)}}
+    if case == "tampered":
+        path.write_text(path.read_text() + " ")
+    elif case == "missing_file":
+        path.unlink()
+    fresh = campaign.attempt("fresh", manifest=manifest)
+    if case == "non_prior":
+        launch_path = fresh / "launch.json"
+        launch = json.loads(launch_path.read_text())
+        launch["started_at"] = 1
+        save(launch_path, launch)
+    with pytest.raises((ValueError, FileNotFoundError)):
+        select(campaign)
+    assert not (campaign.root / "selection").exists()
+
+
+def test_ledger_bound_initial_generation_keeps_retry_lineage_and_cap(campaign):
+    select(campaign, name="before-any-launch")
+    fresh = campaign.attempt(
+        "fresh",
+        manifest=initial_manifest(
+            campaign, campaign.root / "before-any-launch/ledger.json", ["b"]
+        ),
+    )
+    select(campaign, name="after-first", infrastructure=diagnose(fresh, "b"))
+    retry_manifest = json.loads(
+        (campaign.root / "after-first/retry/000.json").read_text()
+    )
+    campaign.attempt("retry", manifest=retry_manifest)
+    final = select(campaign, name="after-second")
+    entry = final["samples"][1]
+    assert entry["action"] == "exhausted"
+    assert entry["raw_assigned_launches"] == entry["launched_generation_attempts"] == 2
+    campaign.attempt("third", manifest=retry_manifest)
+    with pytest.raises(ValueError, match="more than one additional"):
+        select(campaign, name="after-third")
+
+
+def test_ledger_bound_initial_generation_cannot_hide_prior_assignment(campaign):
+    select(campaign, name="before-any-launch")
+    campaign.attempt("prior-assignment", ids=["b"])
+    campaign.attempt(
+        "fresh",
+        manifest=initial_manifest(
+            campaign, campaign.root / "before-any-launch/ledger.json", ["b"]
+        ),
+    )
+    with pytest.raises(ValueError, match="overlapping initial"):
+        select(campaign)
