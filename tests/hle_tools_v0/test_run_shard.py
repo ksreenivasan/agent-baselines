@@ -1,3 +1,4 @@
+import errno
 import importlib.util
 import json
 import signal
@@ -728,3 +729,153 @@ def test_cgroup_mountpoint_octal_escapes_are_decoded(tmp_path):
     mount = str(cgroup.parents[1]).replace(" ", chr(92) + "040")
     (proc / "self/mountinfo").write_text(f"10 1 0:1 / {mount} rw - cgroup2 cgroup rw\n")
     assert runner.job_memory_cgroup("12345", proc)[0] == cgroup
+
+
+@pytest.mark.parametrize("name", ["stat", "status", "cgroup"])
+@pytest.mark.parametrize("pressure", [False, True])
+def test_optional_proc_io_error_does_not_disable_core_guard(
+    tmp_path, monkeypatch, name, pressure
+):
+    proc, cgroup = memory_tree(tmp_path)
+    fake_process(proc, cgroup, 11)
+    fake_process(proc, cgroup, 12)
+    if pressure:
+        (cgroup / "memory.current").write_text(str(52 * 1024**3))
+    original = Path.read_text
+
+    def read(path, *args, **kwargs):
+        if path == proc / "11" / name:
+            raise OSError(errno.EIO, "sensitive diagnostic text", str(path))
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    local = tmp_path / "local"
+    local.mkdir()
+    monitor = runner.MemoryMonitor("12345", local, proc)
+    problem = monitor.problem()
+    assert bool(problem) is pressure
+    assert monitor.failure is None
+    assert monitor.latest["pressure"] is pressure
+    assert [row["pid"] for row in monitor.latest["processes"]] == [12]
+    assert monitor.latest["pids_unavailable"] == 1
+    assert monitor.latest["inventory_read_errors"] == {"proc_read": {"EIO": 1}}
+    assert "sensitive" not in json.dumps(monitor.evidence())
+
+
+@pytest.mark.parametrize("location", ["root", "descendant", "walk"])
+def test_optional_cgroup_inventory_io_errors_are_explicit(
+    tmp_path, monkeypatch, location
+):
+    proc, cgroup = memory_tree(tmp_path)
+    child = cgroup / "exiting-step"
+    child.mkdir()
+    (child / "cgroup.procs").write_text("")
+    original_read = Path.read_text
+    original_walk = runner.os.walk
+
+    def read(path, *args, **kwargs):
+        affected = cgroup if location == "root" else child
+        if location != "walk" and path == affected / "cgroup.procs":
+            raise OSError(errno.ENODEV, "cgroup removed", str(path))
+        return original_read(path, *args, **kwargs)
+
+    def walk(path, *, onerror):
+        yield from original_walk(path, onerror=onerror)
+        onerror(OSError(errno.ENODEV, "cgroup removed", str(child)))
+
+    monkeypatch.setattr(Path, "read_text", read)
+    if location == "walk":
+        monkeypatch.setattr(runner.os, "walk", walk)
+    snapshot = runner.memory_snapshot(cgroup, "/jobs/job_12345", proc)
+    stage = "cgroup_walk" if location == "walk" else "cgroup_procs"
+    assert snapshot["inventory_read_errors"] == {stage: {"ENODEV": 1}}
+    assert snapshot["working_set_bytes"] == 3 * 1024**3
+    assert not snapshot["pressure"]
+
+
+@pytest.mark.parametrize(
+    "name", ["memory.max", "memory.current", "memory.stat", "memory.events"]
+)
+def test_core_memory_io_errors_still_fail_closed(tmp_path, monkeypatch, name):
+    proc, cgroup = memory_tree(tmp_path)
+    original = Path.read_text
+
+    def read(path, *args, **kwargs):
+        if path == cgroup / name:
+            raise OSError(errno.EIO, "sensitive diagnostic text", str(path))
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    monitor = runner.MemoryMonitor("12345", tmp_path, proc)
+    assert monitor.problem() == "memory infrastructure guard unavailable: OSError"
+    assert monitor.evidence()["failure_detail"] == {
+        "stage": "memory_snapshot",
+        "errno": errno.EIO,
+        "errno_name": "EIO",
+        "file": name,
+    }
+    assert "sensitive" not in json.dumps(monitor.evidence())
+
+
+@pytest.mark.parametrize(
+    "stage", ["telemetry_rotate", "telemetry_append", "telemetry_publish"]
+)
+def test_memory_telemetry_io_errors_still_fail_closed(tmp_path, monkeypatch, stage):
+    proc, _ = memory_tree(tmp_path)
+    monitor = runner.MemoryMonitor("12345", tmp_path, proc)
+    monitor.sample()
+
+    def fail(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "sensitive diagnostic text")
+
+    if stage == "telemetry_rotate":
+        monkeypatch.setattr(runner, "_MEMORY_LOG_BYTES", 1)
+        monkeypatch.setattr(Path, "replace", fail)
+    elif stage == "telemetry_append":
+        monkeypatch.setattr(Path, "open", fail)
+
+        # read_text also uses open; restrict the fault to the telemetry append.
+        def read(path, *args, **kwargs):
+            with open(path) as stream:
+                return stream.read()
+
+        monkeypatch.setattr(Path, "read_text", read)
+    else:
+        monkeypatch.setattr(runner, "atomic_json", fail)
+    assert monitor.problem() == "memory infrastructure guard unavailable: OSError"
+    assert monitor.evidence()["failure_detail"] == {
+        "stage": stage,
+        "errno": errno.ENOSPC,
+        "errno_name": "ENOSPC",
+        "file": None,
+    }
+    assert "sensitive" not in json.dumps(monitor.evidence())
+
+
+def test_real_exited_proc_descriptor_is_unavailable_not_guard_failure(
+    tmp_path, monkeypatch
+):
+    proc, cgroup = memory_tree(tmp_path)
+    fake_process(proc, cgroup, 11)
+    fake_process(proc, cgroup, 12)
+    # Force a real Linux lifetime race: /proc opens successfully, then the
+    # test-owned process exits before the kernel serves the file read.
+    with subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.read()"],
+        stdin=subprocess.PIPE,
+    ) as child:
+        with open(f"/proc/{child.pid}/cgroup") as descriptor:
+            child.communicate(timeout=5)
+            original = Path.read_text
+
+            def read(path, *args, **kwargs):
+                if path == proc / "11/cgroup":
+                    return descriptor.read()
+                return original(path, *args, **kwargs)
+
+            monkeypatch.setattr(Path, "read_text", read)
+            snapshot = runner.memory_snapshot(cgroup, "/jobs/job_12345", proc)
+    assert snapshot["pids_unavailable"] == 1
+    assert snapshot["inventory_read_errors"] == {"proc_read": {"ESRCH": 1}}
+    assert [row["pid"] for row in snapshot["processes"]] == [12]
+    assert not snapshot["pressure"]

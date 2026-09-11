@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -110,10 +111,15 @@ def memory_snapshot(
     pids: set[int] = set()
     groups = 0
     inventory_truncated = False
+    inventory_errors: dict[str, dict[str, int]] = {}
+
+    def inventory_error(stage: str, error: OSError) -> None:
+        code = errno.errorcode.get(error.errno or 0, "UNKNOWN")
+        counts = inventory_errors.setdefault(stage, {})
+        counts[code] = counts.get(code, 0) + 1
 
     def walk_error(error: OSError) -> None:
-        if not isinstance(error, FileNotFoundError):
-            raise error
+        inventory_error("cgroup_walk", error)
 
     for directory, children, _files in os.walk(cgroup, onerror=walk_error):
         groups += 1
@@ -123,9 +129,8 @@ def memory_snapshot(
         children.sort()
         try:
             members = (Path(directory) / "cgroup.procs").read_text().split()
-        except FileNotFoundError:
-            if Path(directory) == cgroup:
-                raise
+        except OSError as error:
+            inventory_error("cgroup_procs", error)
             continue
         for value in members:
             pids.add(int(value))
@@ -168,14 +173,10 @@ def memory_snapshot(
                     int(field_value.split()[0]) if field_value else None
                 )
             processes.append(record)
-        except (
-            FileNotFoundError,
-            ProcessLookupError,
-            PermissionError,
-            ValueError,
-            IndexError,
-            KeyError,
-        ):
+        except OSError as error:
+            inventory_error("proc_read", error)
+            unavailable += 1
+        except (ValueError, IndexError, KeyError):
             unavailable += 1
     processes.sort(key=lambda item: (item["VmRSS_kib"] or 0, item["pid"]), reverse=True)
     snapshot.update(
@@ -184,6 +185,7 @@ def memory_snapshot(
         pids_observed=len(pids),
         pids_unavailable=unavailable,
         inventory_truncated=inventory_truncated,
+        inventory_read_errors=inventory_errors,
     )
     return snapshot
 
@@ -195,20 +197,26 @@ class MemoryMonitor:
         self.local = local
         self.latest: dict[str, Any] = {}
         self.failure: str | None = None
+        self.failure_detail: dict[str, Any] | None = None
+        self.stage = "memory_snapshot"
 
     def sample(self) -> dict[str, Any]:
+        self.stage = "memory_snapshot"
         self.latest = memory_snapshot(self.cgroup, self.job_path, self.proc)
         encoded = json.dumps(self.latest, sort_keys=True) + "\n"
         path = self.local / "memory.jsonl"
+        self.stage = "telemetry_rotate"
         if (
             path.exists()
             and path.stat().st_size + len(encoded.encode()) > _MEMORY_LOG_BYTES
         ):
             path.replace(self.local / "memory.previous.jsonl")
+        self.stage = "telemetry_append"
         with path.open("a") as stream:
             stream.write(encoded)
             stream.flush()
             os.fsync(stream.fileno())
+        self.stage = "telemetry_publish"
         atomic_json(self.local / "memory-latest.json", self.latest)
         return self.latest
 
@@ -218,6 +226,31 @@ class MemoryMonitor:
                 return "memory infrastructure guard: whole-job working set reached 75% limit"
         except (OSError, ValueError) as error:
             self.failure = type(error).__name__
+            number = error.errno if isinstance(error, OSError) else None
+            filename = (
+                Path(error.filename).name
+                if isinstance(error, OSError) and error.filename
+                else None
+            )
+            self.failure_detail = {
+                "stage": self.stage,
+                "errno": number,
+                "errno_name": errno.errorcode.get(number or 0, "UNKNOWN"),
+                "file": (
+                    filename
+                    if filename
+                    in {
+                        "memory.max",
+                        "memory.current",
+                        "memory.stat",
+                        "memory.events",
+                        "memory.jsonl",
+                        "memory.previous.jsonl",
+                        "memory-latest.json",
+                    }
+                    else None
+                ),
+            }
             return f"memory infrastructure guard unavailable: {self.failure}"
         return None
 
@@ -237,6 +270,7 @@ class MemoryMonitor:
             "max_pid_records": _MEMORY_PID_LIMIT,
             "latest": self.latest,
             "failure": self.failure,
+            "failure_detail": self.failure_detail,
             "scope": "whole Slurm job; infrastructure containment, not a tool resource limit",
         }
 
