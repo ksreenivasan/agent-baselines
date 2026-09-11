@@ -57,8 +57,17 @@ def campaign(tmp_path):
     )
 
     def attempt(
-        name, rows=None, *, ids=None, manifest=None, complete=False, status="success"
+        name,
+        rows=None,
+        *,
+        ids=None,
+        manifest=None,
+        complete=False,
+        status="success",
+        runtime_config=None,
     ):
+        attempt_cfg = runtime_config or cfg
+        attempt_config = json.loads(attempt_cfg.read_text())
         directory = (tmp_path / name).resolve()
         state.counter += 1
         if manifest is None:
@@ -71,8 +80,8 @@ def campaign(tmp_path):
         save(
             directory / "launch.json",
             {
-                "config": config,
-                "config_sha256": file_digest(cfg),
+                "config": attempt_config,
+                "config_sha256": file_digest(attempt_cfg),
                 "source_commit": COMMIT,
                 "started_at": state.counter,
                 "manifest": manifest,
@@ -82,7 +91,7 @@ def campaign(tmp_path):
         )
         if rows is not None:
             archive = write_archive(
-                directory / "logs/result.eval", config, rows, status=status
+                directory / "logs/result.eval", attempt_config, rows, status=status
             )
             native = read_eval_log(archive)
             native.eval.task_args["manifest_path"] = str(path)
@@ -882,3 +891,118 @@ def test_ledger_bound_initial_generation_cannot_hide_prior_assignment(campaign):
     )
     with pytest.raises(ValueError, match="overlapping initial"):
         select(campaign)
+
+
+def test_runtime_extension_preserves_old_ledger_and_initial_lineage(campaign):
+    previous = campaign.attempt(
+        "prior", [row("a", campaign.config, "I")], ids=["a"], complete=True
+    )
+    prior = select(campaign, name="prior-selection")
+    runtime = save(campaign.root / "con24.json", {**campaign.config, "concurrency": 24})
+    variant = json.loads(runtime.read_text())
+    fresh = campaign.attempt(
+        "fresh",
+        [row("b", variant), row("c", variant, "I")],
+        manifest=initial_manifest(
+            campaign, campaign.root / "prior-selection/ledger.json", ["b", "c"]
+        ),
+        complete=True,
+        runtime_config=runtime,
+    )
+    with pytest.raises(ValueError, match="launch configuration"):
+        select(campaign)
+    allowed = {str(runtime): file_digest(runtime)}
+    final = select(campaign, allowed_runtime_configs=allowed)
+    assert final["samples"][0] == prior["samples"][0]
+    assert final["attempts"][str(previous)] == prior["attempts"][str(previous)]
+    assert final["attempts"][str(fresh)]["runtime_config"] == selector.binding(runtime)
+    assert final["config"] == prior["config"]
+    assert final["counts"] == {"retain": 3, "unlaunched": 1}
+    assert final["allowed_runtime_configs"][0]["configuration"] == variant
+    # A later first-generation shard must still verify history containing the variant.
+    campaign.attempt(
+        "last",
+        [row("d", variant)],
+        manifest=initial_manifest(
+            campaign, campaign.root / "selection/ledger.json", ["d"]
+        ),
+        complete=True,
+        runtime_config=runtime,
+    )
+    complete = select(campaign, name="complete", allowed_runtime_configs=allowed)
+    assert complete["counts"] == {"retain": 4}
+    assert complete["samples"][:3] == final["samples"][:3]
+
+
+def test_runtime_variant_retry_keeps_existing_budget_and_ledger(campaign):
+    first = campaign.attempt("first", ids=["a"])
+    select(campaign, name="before-retry", infrastructure=diagnose(first, "a"))
+    manifest = json.loads((campaign.root / "before-retry/retry/000.json").read_text())
+    runtime = save(campaign.root / "con24.json", {**campaign.config, "concurrency": 24})
+    second = campaign.attempt("retry", manifest=manifest, runtime_config=runtime)
+    allowed = {str(runtime): file_digest(runtime)}
+    final = select(campaign, allowed_runtime_configs=allowed)
+    assert final["samples"][0]["action"] == "exhausted"
+    assert final["samples"][0]["launched_generation_attempts"] == 2
+    assert final["attempts"][str(second)]["runtime_config"] == selector.binding(runtime)
+    campaign.attempt("third", manifest=manifest, runtime_config=runtime)
+    with pytest.raises(ValueError, match="more than one additional"):
+        select(campaign, name="third-selection", allowed_runtime_configs=allowed)
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "header",
+        "event",
+        "launch_hash",
+        "allowlist_hash",
+        "sampling",
+        "timeout",
+        "judge",
+        "retry",
+    ],
+)
+def test_selector_checks_runtime_variant_identity_and_native_settings(
+    campaign, mismatch
+):
+    variant = {**campaign.config, "concurrency": 24}
+    if mismatch in {"sampling", "timeout", "judge", "retry"}:
+        key, value = {
+            "sampling": ("top_p", 0.95),
+            "timeout": ("timeout", 999),
+            "judge": ("judge_model", "openai/other"),
+            "retry": ("max_retries", 3),
+        }[mismatch]
+        variant[key] = value
+    runtime = save(campaign.root / "con24.json", variant)
+    samples = [row("a", variant)]
+    if mismatch == "event":
+        samples[0]["events"][0]["config"]["max_connections"] = 3
+    attempt = campaign.attempt(
+        "new",
+        samples,
+        ids=["a"],
+        complete=True,
+        runtime_config=runtime,
+    )
+    if mismatch == "header":
+        archive = attempt / "logs/result.eval"
+        log = read_eval_log(archive)
+        log.eval.model_generate_config.max_connections = 3
+        write_eval_log(log, archive)
+        result_path = attempt / "result.json"
+        result = json.loads(result_path.read_text())
+        result["archive_sha256"] = file_digest(archive)
+        save(result_path, result)
+    elif mismatch == "launch_hash":
+        launch_path = attempt / "launch.json"
+        launch = json.loads(launch_path.read_text())
+        launch["config_sha256"] = "f" * 64
+        save(launch_path, launch)
+    allowed = {
+        str(runtime): "f" * 64 if mismatch == "allowlist_hash" else file_digest(runtime)
+    }
+    with pytest.raises(ValueError):
+        select(campaign, allowed_runtime_configs=allowed)
+    assert not (campaign.root / "selection").exists()

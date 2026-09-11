@@ -340,6 +340,22 @@ sample invalidations and fatal sentinels are not cleared by this classification.
 
 ## Residual selection
 
+Both aggregation and residual selection accept repeatable
+`--runtime-config /absolute/config.json SHA256` arguments (Python API:
+`allowed_runtime_configs={"/absolute/config.json": "SHA256"}`). Keep
+`--config` at the original frozen campaign configuration. Each additional file
+must match its supplied digest and differ from that configuration **only** in
+positive integer `concurrency`; sampling, timeouts, retries, prompts, model,
+judge, endpoint, and dataset settings remain identical. Without this explicit
+allowance, configuration matching stays exact.
+
+Each production launch must match an approved file's digest and full contents.
+Its native header and solver events must record that launch's concurrency.
+The output records the allowed configurations and per-variant file bindings;
+earlier selection rows and primary-configuration attempt records stay unchanged.
+Historical recovery shards continue to use the original campaign configuration.
+This option neither authorizes extra generation attempts nor changes retry limits.
+
 `m2/residual_selection.py` prepares retry manifests without launching work. Its
 expected manifest is the initial new-generation ID set, excluding retained
 historical answers. Supply every current production attempt directory, including

@@ -42,6 +42,72 @@ def checked_file(path: str | Path, expected: str) -> Path:
     return path
 
 
+def runtime_configurations(
+    config_path: Path, allowed: dict[str, str] | None = None
+) -> list[dict]:
+    """Allow only explicitly hash-bound concurrency variants of one configuration."""
+    config = read_json(config_path)
+    entries = [
+        {
+            "path": str(config_path.resolve()),
+            "sha256": file_digest(config_path),
+            "configuration": config,
+        }
+    ]
+    for path, checksum in (allowed or {}).items():
+        candidate_path = checked_file(path, checksum)
+        candidate = read_json(candidate_path)
+        require(
+            all(
+                type(value.get("concurrency")) is int and value["concurrency"] > 0
+                for value in (config, candidate)
+            ),
+            "runtime configuration concurrency must be a positive integer",
+        )
+        require(
+            json.dumps(
+                {
+                    key: value
+                    for key, value in candidate.items()
+                    if key != "concurrency"
+                },
+                sort_keys=True,
+            )
+            == json.dumps(
+                {key: value for key, value in config.items() if key != "concurrency"},
+                sort_keys=True,
+            ),
+            "runtime configuration may differ only in concurrency",
+        )
+        entries.append(
+            {
+                "path": str(candidate_path),
+                "sha256": checksum,
+                "configuration": candidate,
+            }
+        )
+    return entries
+
+
+def launch_configuration(launch: dict, configurations: list[dict]) -> dict:
+    matches = [
+        entry
+        for entry in configurations
+        if entry["sha256"] == launch["config_sha256"]
+        and json.dumps(entry["configuration"], sort_keys=True)
+        == json.dumps(launch["config"], sort_keys=True)
+    ]
+    require(
+        matches,
+        "launch configuration differs from frozen or allowed runtime configuration",
+    )
+    return matches[0]
+
+
+def config_binding(entry: dict) -> dict:
+    return {key: entry[key] for key in ("path", "sha256")}
+
+
 def check_settings(actual: dict, config: dict, context: str) -> None:
     require(
         actual.get("max_connections") == config["concurrency"],
@@ -219,11 +285,13 @@ def sources(
     allowed_commits: set[str],
     selections: dict[str, list[str]],
     judge_adoption: Path | None = None,
+    allowed_runtime_configs: dict[str, str] | None = None,
 ) -> tuple[list[dict], dict[str, dict], dict]:
     config = read_json(config_path)
+    configurations = runtime_configurations(config_path, allowed_runtime_configs)
     inputs = []
     approvals = {}
-    provenance = {}
+    provenance: dict[str, Any] = {}
     if ledger_path:
         ledger = read_json(ledger_path)
         provenance["ledger"] = {
@@ -343,11 +411,7 @@ def sources(
             result.get("publisher_exit") == 0,
             "attempt has no successful final publication",
         )
-        require(
-            launch["config_sha256"] == file_digest(config_path)
-            and launch["config"] == config,
-            "launch configuration differs from frozen full configuration",
-        )
+        runtime = launch_configuration(launch, configurations)
         commit = launch["source_commit"]
         require(commit in allowed_commits, "launch source commit is not approved")
         # Verify the exact file bytes used by the launch, not a reserialized JSON hash.
@@ -384,12 +448,19 @@ def sources(
                 "result": str(result_path),
                 "result_sha256": file_digest(result_path),
                 "launch_sha256": file_digest(launch_path),
+                **(
+                    {"runtime_config": config_binding(runtime)}
+                    if allowed_runtime_configs
+                    else {}
+                ),
             }
         )
     require(
         set(selections) <= {str(path.resolve()) for path in attempts},
         "selection names an unprovided attempt",
     )
+    if allowed_runtime_configs:
+        provenance["allowed_runtime_configs"] = configurations[1:]
     return inputs, approvals, provenance
 
 
@@ -567,6 +638,7 @@ def aggregate(
     attempts: list[Path] | None = None,
     allowed_commits: set[str] | None = None,
     selections: dict[str, list[str]] | None = None,
+    allowed_runtime_configs: dict[str, str] | None = None,
 ) -> dict:
     config, manifest, protocol = map(
         read_json, (config_path, manifest_path, protocol_path)
@@ -615,6 +687,7 @@ def aggregate(
         allowed_commits or set(),
         selections or {},
         judge_adoption,
+        allowed_runtime_configs,
     )
     outcomes = {}
     rejected_attempts = []
@@ -625,7 +698,16 @@ def aggregate(
         header = read_eval_log(path, header_only=True).model_dump(
             mode="json", exclude_none=True
         )
-        check_header(header, config, explicit is not None)
+        entry_config = (
+            read_json(
+                checked_file(
+                    entry["runtime_config"]["path"], entry["runtime_config"]["sha256"]
+                )
+            )
+            if "runtime_config" in entry
+            else config
+        )
+        check_header(header, entry_config, explicit is not None)
         revision = header["eval"].get("revision")
         if entry["kind"] == "production":
             require(
@@ -714,7 +796,9 @@ def aggregate(
             require(events, "accepted outcome has no recorded solver model request")
             for event in events:
                 check_settings(
-                    event.get("config", {}), config, f"actual request for {sample_id}"
+                    event.get("config", {}),
+                    entry_config,
+                    f"actual request for {sample_id}",
                 )
             outcomes[sample_id] = {
                 "id": sample_id,
@@ -811,6 +895,14 @@ def main() -> None:
         return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument(
+        "--runtime-config",
+        nargs=2,
+        action="append",
+        default=[],
+        metavar=("PATH", "SHA256"),
+        help="Explicit hash-bound configuration allowed to differ only in concurrency",
+    )
     parser.add_argument("--expected-manifest", type=Path, required=True)
     parser.add_argument("--protocol", type=Path, required=True)
     parser.add_argument("--source-commit", action="append", default=[])
@@ -846,6 +938,7 @@ def main() -> None:
         selections=(
             read_json(args.partial_selection) if args.partial_selection else None
         ),
+        allowed_runtime_configs=dict(args.runtime_config),
     )
     print(json.dumps(summary, sort_keys=True))
 

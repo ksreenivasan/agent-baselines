@@ -181,9 +181,21 @@ def campaign(tmp_path):
         attempts=[],
     )
 
-    def attempt(name, rows, *, manifest_ids=None, status="success", selection=False):
+    def attempt(
+        name,
+        rows,
+        *,
+        manifest_ids=None,
+        status="success",
+        selection=False,
+        runtime_config=None,
+    ):
+        attempt_cfg = runtime_config or cfg
+        attempt_config = json.loads(attempt_cfg.read_text())
         root = tmp_path / name
-        path = write_archive(root / "logs" / "result.eval", config, rows, status=status)
+        path = write_archive(
+            root / "logs" / "result.eval", attempt_config, rows, status=status
+        )
         input_manifest = save(
             root / "manifest.json",
             {
@@ -192,8 +204,8 @@ def campaign(tmp_path):
             },
         )
         launch = {
-            "config": config,
-            "config_sha256": file_digest(cfg),
+            "config": attempt_config,
+            "config_sha256": file_digest(attempt_cfg),
             "source_commit": COMMIT,
             "manifest": json.loads(input_manifest.read_text()),
             "manifest_sha256": file_digest(input_manifest),
@@ -695,3 +707,154 @@ def test_native_limit_and_failed_events_remain_valid_outcomes(campaign):
     assert summary["samples_with_elapsed_time"] == 1
     assert summary["metric_availability"]["samples_without_elapsed_time"] == 1
     assert "Not campaign wall time" in summary["duration_scope"]
+
+
+def test_explicit_concurrency_variant_merges_native_results(campaign):
+    runtime = save(campaign.root / "con24.json", {**campaign.config, "concurrency": 24})
+    variant = json.loads(runtime.read_text())
+    campaign.attempt("old", [row("a", campaign.config, "I")])
+    campaign.attempt("new", [row("b", variant)], runtime_config=runtime)
+    with pytest.raises(ValueError, match="launch configuration"):
+        aggregate(campaign)
+    summary = aggregate(
+        campaign, allowed_runtime_configs={str(runtime): file_digest(runtime)}
+    )
+    assert summary["complete"] and summary["correct"] == 1
+    assert summary["configuration"]["concurrency"] == 3
+    assert summary["allowed_runtime_configs"] == [
+        {
+            "path": str(runtime),
+            "sha256": file_digest(runtime),
+            "configuration": variant,
+        }
+    ]
+    shards = json.loads((campaign.output / "shards.json").read_text())
+    assert [item["runtime_config"]["sha256"] for item in shards] == [
+        file_digest(campaign.cfg),
+        file_digest(runtime),
+    ]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"top_p": 0.95},
+        {"temperature": 1},
+        {"max_tokens": 100},
+        {"reasoning_effort": "medium"},
+        {"reasoning_history": "all"},
+        {"timeout": 661},
+        {"attempt_timeout": 601},
+        {"max_retries": 3},
+        {"judge_model": "openai/other"},
+        {"judge_reasoning_effort": "high"},
+        {"model": "openai/other"},
+        {"model_base_url": "http://other/v1"},
+        {"dataset_revision": "c" * 40},
+        {"search_backend": "other"},
+        {"prompt": "extra"},
+        {"task": "hle_direct"},
+    ],
+)
+def test_runtime_allowance_rejects_any_non_concurrency_change(campaign, mutation):
+    runtime = save(
+        campaign.root / "changed.json",
+        {**campaign.config, "concurrency": 24, **mutation},
+    )
+    with pytest.raises(ValueError, match="only in concurrency"):
+        aggregate(
+            campaign, allowed_runtime_configs={str(runtime): file_digest(runtime)}
+        )
+    assert not campaign.output.exists()
+
+
+@pytest.mark.parametrize("concurrency", [0, -1, True, 24.0, "24", None])
+def test_runtime_allowance_requires_positive_integer(campaign, concurrency):
+    runtime = save(
+        campaign.root / "changed.json", {**campaign.config, "concurrency": concurrency}
+    )
+    with pytest.raises(ValueError, match="positive integer"):
+        aggregate(
+            campaign, allowed_runtime_configs={str(runtime): file_digest(runtime)}
+        )
+
+
+def test_runtime_allowance_checks_exact_file_bytes(campaign):
+    runtime = save(campaign.root / "con24.json", {**campaign.config, "concurrency": 24})
+    checksum = file_digest(runtime)
+    runtime.write_text(runtime.read_text() + " ")
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        aggregate(campaign, allowed_runtime_configs={str(runtime): checksum})
+
+
+@pytest.mark.parametrize(
+    "mismatch", ["native_header", "native_event", "embedded_launch", "launch_hash"]
+)
+def test_runtime_allowance_requires_matching_launch_and_native_settings(
+    campaign, mismatch
+):
+    runtime = save(campaign.root / "con24.json", {**campaign.config, "concurrency": 24})
+    variant = json.loads(runtime.read_text())
+    samples = [row("a", variant), row("b", variant)]
+    if mismatch == "native_event":
+        samples[0]["events"][0]["config"]["max_connections"] = 3
+    result_path = campaign.attempt("new", samples, runtime_config=runtime)
+    if mismatch == "native_header":
+        # Rebind a correctly checksummed archive whose native header contradicts its launch.
+        from inspect_ai.log import read_eval_log
+
+        result = json.loads(result_path.read_text())
+        archive = Path(result["archive"])
+        log = read_eval_log(archive)
+        log.eval.model_generate_config.max_connections = 3
+        write_eval_log(log, archive)
+        result["archive_sha256"] = file_digest(archive)
+        save(result_path, result)
+    elif mismatch in {"embedded_launch", "launch_hash"}:
+        launch_path = result_path.parent / "launch.json"
+        launch = json.loads(launch_path.read_text())
+        if mismatch == "embedded_launch":
+            launch["config"]["concurrency"] = 3
+        else:
+            launch["config_sha256"] = "f" * 64
+        save(launch_path, launch)
+    with pytest.raises(ValueError, match="concurrency|launch configuration"):
+        aggregate(
+            campaign, allowed_runtime_configs={str(runtime): file_digest(runtime)}
+        )
+    assert not campaign.output.exists()
+
+
+@pytest.mark.parametrize("baseline, replacement", [(1.0, True), (1, True), (1, 1.0)])
+def test_runtime_allowance_rejects_changed_json_types(tmp_path, baseline, replacement):
+    config = {**configuration(1), "top_p": baseline}
+    original = save(tmp_path / "full.json", config)
+    runtime = save(
+        tmp_path / "variant.json",
+        {**config, "concurrency": 24, "top_p": replacement},
+    )
+    with pytest.raises(ValueError, match="only in concurrency"):
+        aggregator.runtime_configurations(
+            original, {str(runtime): file_digest(runtime)}
+        )
+
+
+@pytest.mark.parametrize("concurrency, embedded", [(24, 24.0), (1, True)])
+def test_runtime_launch_rejects_changed_concurrency_type(
+    campaign, concurrency, embedded
+):
+    runtime = save(
+        campaign.root / "variant.json", {**campaign.config, "concurrency": concurrency}
+    )
+    variant = json.loads(runtime.read_text())
+    result = campaign.attempt(
+        "new", [row("a", variant), row("b", variant)], runtime_config=runtime
+    )
+    launch_path = result.parent / "launch.json"
+    launch = json.loads(launch_path.read_text())
+    launch["config"]["concurrency"] = embedded
+    save(launch_path, launch)
+    with pytest.raises(ValueError, match="launch configuration"):
+        aggregate(
+            campaign, allowed_runtime_configs={str(runtime): file_digest(runtime)}
+        )

@@ -25,8 +25,11 @@ from aggregate_campaign import (
     check_header,
     check_settings,
     checked_file,
+    config_binding,
+    launch_configuration,
     read_json,
     require,
+    runtime_configurations,
 )
 from agent_baselines.evals.hle_tools_v0.recovery import (
     disposition,
@@ -47,15 +50,15 @@ def read_attempt(
     expected: set[str],
     allowed_commits: set[str],
     partial: dict,
+    configurations: list[dict] | None = None,
 ) -> tuple[dict, dict]:
     directory = directory.resolve()
     launch_path = directory / "launch.json"
     launch = read_json(launch_path)
-    require(
-        launch["config"] == config
-        and launch["config_sha256"] == file_digest(config_path),
-        "attempt configuration differs from frozen production configuration",
+    runtime = launch_configuration(
+        launch, configurations or runtime_configurations(config_path)
     )
+    attempt_config = runtime["configuration"]
     require(
         launch["source_commit"] in allowed_commits,
         "attempt source commit is not approved",
@@ -108,6 +111,8 @@ def read_attempt(
         "selection_ledger": manifest.get("selection_ledger"),
         "generation_attempt": manifest.get("generation_attempt", 1),
     }
+    if runtime["sha256"] != file_digest(config_path):
+        record["runtime_config"] = config_binding(runtime)
     rows: dict[str, dict[str, Any]] = {}
     durable_archives = sorted((directory / "logs").glob("*.eval"))
     result_path = directory / "result.json"
@@ -145,7 +150,7 @@ def read_attempt(
     header = read_eval_log(archive, header_only=True).model_dump(
         mode="json", exclude_none=True
     )
-    check_header(header, config, partial=not record["complete"])
+    check_header(header, attempt_config, partial=not record["complete"])
     require(
         header["eval"]["task_args"].get("manifest_path") == str(manifest_path),
         "archive manifest path differs from its launch",
@@ -171,7 +176,9 @@ def read_attempt(
         ]
         for event in events:
             check_settings(
-                event.get("config", {}), config, f"actual request for {sample_id}"
+                event.get("config", {}),
+                attempt_config,
+                f"actual request for {sample_id}",
             )
         if kind in {"retain_score", "judge_only"}:
             require(events, "saved outcome has no recorded solver request")
@@ -418,6 +425,7 @@ def verify_initial_selection(
         )
     prior_attempts = ledger.get("attempts")
     require(isinstance(prior_attempts, dict), "initial selection ledger has no history")
+    assert isinstance(prior_attempts, dict)
     for directory, prior in prior_attempts.items():
         actual = attempts.get(directory)
         require(actual is not None, "initial selection ledger prior attempt is missing")
@@ -445,7 +453,7 @@ def verify_initial_selection(
             not set(prior["ids"]) & set(record["ids"]),
             "initial selection ledger contains a prior sample assignment",
         )
-        for key in ("result", "archive"):
+        for key in ("result", "archive", "runtime_config"):
             if key in prior:
                 require(
                     prior[key] == actual.get(key),
@@ -465,6 +473,7 @@ def select(
     infrastructure: dict | None = None,
     shard_size: int = 200,
     preflight_exclusion: Path | None = None,
+    allowed_runtime_configs: dict[str, str] | None = None,
 ) -> dict:
     config, expected_manifest, protocol = map(
         read_json, (config_path, expected_path, protocol_path)
@@ -498,6 +507,7 @@ def select(
         and expected_manifest.get("dataset_variant", "standard") == "standard",
         "expected manifest protocol differs",
     )
+    configurations = runtime_configurations(config_path, allowed_runtime_configs)
     partial, infrastructure = partial or {}, infrastructure or {}
     require(set(infrastructure) <= set(ids), "infrastructure selection has unknown IDs")
     directories = [str(path.resolve()) for path in attempt_dirs]
@@ -509,7 +519,13 @@ def select(
     attempts, outcomes = {}, {}
     for directory in directories:
         record, rows = read_attempt(
-            Path(directory), config_path, config, set(ids), allowed_commits, partial
+            Path(directory),
+            config_path,
+            config,
+            set(ids),
+            allowed_commits,
+            partial,
+            configurations,
         )
         attempts[directory], outcomes[directory] = record, rows
     exclusion = read_preflight_exclusion(
@@ -644,6 +660,8 @@ def select(
         "closure_policy": "closed:true attests an actual stopped/finished job check; elapsed time is insufficient",
         "dispatch_policy": "no dispatch; supply all current launched attempts and revalidate immediately before dispatch",
     }
+    if allowed_runtime_configs:
+        ledger["allowed_runtime_configs"] = configurations[1:]
     if exclusion is not None:
         ledger["preflight_exclusion"] = exclusion["binding"]
         ledger["attempt_accounting"] = (
@@ -725,6 +743,14 @@ def main() -> None:
     for flag in ("config", "expected-manifest", "protocol", "output"):
         parser.add_argument(f"--{flag}", type=Path, required=True)
     parser.add_argument("--attempt", type=Path, action="append", default=[])
+    parser.add_argument(
+        "--runtime-config",
+        nargs=2,
+        action="append",
+        default=[],
+        metavar=("PATH", "SHA256"),
+        help="Explicit hash-bound configuration allowed to differ only in concurrency",
+    )
     parser.add_argument("--source-commit", action="append", default=[])
     parser.add_argument("--partial-selection", type=Path)
     parser.add_argument("--infrastructure-selection", type=Path)
@@ -746,6 +772,7 @@ def main() -> None:
         ),
         shard_size=args.shard_size,
         preflight_exclusion=args.preflight_exclusion,
+        allowed_runtime_configs=dict(args.runtime_config),
     )
     print(
         json.dumps(
