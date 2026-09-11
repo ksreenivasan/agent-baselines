@@ -308,7 +308,7 @@ async def _keenable_search(query: str, max_results: int) -> list[dict[str, str |
                         )
                     phase = "client_close"
                     raise
-                if response.status_code in {500, 504}:
+                if response.status_code in {500, 502, 504}:
                     unrecovered_server_error = True
                     diagnostics = _http_error_diagnostics("keenable", response)
                     last_server_error_diagnostics = {
@@ -322,7 +322,7 @@ async def _keenable_search(query: str, max_results: int) -> list[dict[str, str |
                     _search_transport_event(
                         retry_id, attempt_number, terminal=True, response=response
                     )
-                if response.status_code not in {429, 500, 504} or attempt == 1:
+                if response.status_code not in {429, 500, 502, 504} or attempt == 1:
                     break
                 retry_id = uuid4().hex
                 _search_transport_event(retry_id, 1, terminal=False, response=response)

@@ -637,7 +637,7 @@ def fake_keenable_http(monkeypatch, tmp_path):
     return configure
 
 
-@pytest.mark.parametrize("initial", [500, 504, 429])
+@pytest.mark.parametrize("initial", [500, 502, 504, 429])
 def test_transient_retry_success_uses_identical_request_without_invalidation(
     fake_keenable_http, initial
 ):
@@ -672,7 +672,8 @@ def test_transient_retry_success_uses_identical_request_without_invalidation(
 
 
 @pytest.mark.parametrize(
-    "initial,final", [(a, b) for a in (500, 504, 429) for b in (500, 504, 429)]
+    "initial,final",
+    [(a, b) for a in (500, 502, 504, 429) for b in (500, 502, 504, 429)],
 )
 def test_retry_exhaustion_invalidates_once_and_never_makes_a_third_request(
     fake_keenable_http, initial, final
@@ -688,7 +689,7 @@ def test_retry_exhaustion_invalidates_once_and_never_makes_a_third_request(
     assert len(fixture.state.metadata["hle_tools_search_transport_attempts"]) == 2
 
 
-@pytest.mark.parametrize("status", [401, 402, 403, 404, 422, 502, 503])
+@pytest.mark.parametrize("status", [401, 402, 403, 404, 422, 503])
 def test_no_new_retry_for_auth_content_or_other_5xx(fake_keenable_http, status):
     fixture = fake_keenable_http([status])
     result = asyncio.run(web_search()(query="safe query"))
@@ -706,7 +707,7 @@ def test_no_new_retry_for_auth_content_or_other_5xx(fake_keenable_http, status):
         (httpx.ConnectError("private-query synthetic-key"), "search_transport_error"),
     ],
 )
-@pytest.mark.parametrize("initial", [500, 504])
+@pytest.mark.parametrize("initial", [500, 502, 504])
 def test_retry_final_transport_exception_keeps_evidence_and_existing_error(
     fake_keenable_http, error, expected, initial
 ):
@@ -721,7 +722,7 @@ def test_retry_final_transport_exception_keeps_evidence_and_existing_error(
     assert "private-query" not in sidecar and "synthetic-key" not in sidecar
 
 
-@pytest.mark.parametrize("initial", [500, 504, 429])
+@pytest.mark.parametrize("initial", [500, 502, 504, 429])
 @pytest.mark.parametrize("phase", ["backoff", "request"])
 def test_cancellation_is_reraised_and_only_unrecovered_server_error_invalidates(
     monkeypatch, fake_keenable_http, initial, phase
@@ -742,9 +743,9 @@ def test_cancellation_is_reraised_and_only_unrecovered_server_error_invalidates(
     assert events[-1]["phase"] == phase
     assert events[-1]["terminal"] is True
     assert bool(fixture.state.metadata.get("hle_tools_invalidated")) is (
-        initial in {500, 504}
+        initial in {500, 502, 504}
     )
-    if initial in {500, 504}:
+    if initial in {500, 502, 504}:
         invalidation = fixture.state.metadata["hle_tools_infrastructure_errors"][0]
         assert invalidation["error"] == "search_retry_cancelled"
         assert invalidation["http_diagnostics"] == events[0]["http_diagnostics"]
@@ -762,7 +763,7 @@ def test_first_request_cancellation_is_unchanged(fake_keenable_http):
     assert not fixture.guard.exists()
 
 
-@pytest.mark.parametrize("initial", [500, 504])
+@pytest.mark.parametrize("initial", [500, 502, 504])
 def test_existing_deadline_cancels_retry_without_a_new_timeout_policy(
     fake_keenable_http, initial
 ):
@@ -783,7 +784,7 @@ def test_existing_deadline_cancels_retry_without_a_new_timeout_policy(
     )
 
 
-@pytest.mark.parametrize("initial", [500, 504])
+@pytest.mark.parametrize("initial", [500, 502, 504])
 def test_recovered_server_error_preserves_prior_invalidation(
     fake_keenable_http, initial
 ):
@@ -797,9 +798,10 @@ def test_recovered_server_error_preserves_prior_invalidation(
     assert fixture.state.metadata["hle_tools_infrastructure_errors"] == [prior]
 
 
-@pytest.mark.parametrize("initial", [500, 504])
+@pytest.mark.parametrize("initial", [500, 502, 504])
 @pytest.mark.parametrize(
-    "final,expected", [(200, "retain_score"), (500, "generate"), (504, "generate")]
+    "final,expected",
+    [(200, "retain_score"), (500, "generate"), (502, "generate"), (504, "generate")],
 )
 def test_native_retry_evidence_and_acceptance_round_trip(
     monkeypatch, fake_keenable_http, tmp_path, final, expected, initial
@@ -878,8 +880,14 @@ def test_native_retry_evidence_and_acceptance_round_trip(
         ([500, 504], True),
         ([504, 500], True),
         ([504, 504], True),
+        ([502, 502], True),
+        ([500, 502], True),
+        ([502, 500], True),
+        ([502, 504], True),
+        ([504, 502], True),
         ([500, 200], False),
         ([504, 200], False),
+        ([502, 200], False),
         ([429, 429], False),
         ([200], False),
     ],
