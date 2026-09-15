@@ -2,11 +2,14 @@ import asyncio
 import hashlib
 import ipaddress
 import json
+import math
 import os
+import random
 import re
 import socket
 import time
 from contextvars import ContextVar
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -20,7 +23,58 @@ _allowed_urls: ContextVar[set[str] | None] = ContextVar(
 )
 _FIXTURE_URL = "https://example.com/hle-tools-v0-fixture"
 _SEARCH_FAILURE_LIMIT = 3
+_KEENABLE_MAX_ATTEMPTS = 3
+_KEENABLE_MAX_ELAPSED = 60.0
+_KEENABLE_BACKOFF_BASE = 2.0
 _search_failures: dict[str, int] = {}
+_keenable_gate_loop: asyncio.AbstractEventLoop | None = None
+_keenable_gate_lock: asyncio.Lock | None = None
+_keenable_next_start = 0.0
+
+
+def _keenable_request_rate() -> float:
+    name = "HLE_KEENABLE_REQUESTS_PER_SECOND"
+    try:
+        rate = float(os.environ.get(name, "4"))
+    except ValueError:
+        raise RuntimeError(f"{name} must be a positive finite number") from None
+    if not math.isfinite(rate) or rate <= 0:
+        raise RuntimeError(f"{name} must be a positive finite number")
+    return rate
+
+
+async def _wait_for_keenable_request() -> None:
+    """Space Keenable API request starts across this process's active event loop."""
+    global _keenable_gate_loop, _keenable_gate_lock, _keenable_next_start
+    interval = 1.0 / _keenable_request_rate()
+    loop = asyncio.get_running_loop()
+    if loop is not _keenable_gate_loop:
+        _keenable_gate_loop = loop
+        _keenable_gate_lock = asyncio.Lock()
+        _keenable_next_start = 0.0
+    assert _keenable_gate_lock is not None
+    async with _keenable_gate_lock:
+        while (delay := _keenable_next_start - time.monotonic()) > 0:
+            await asyncio.sleep(delay)
+        _keenable_next_start = time.monotonic() + interval
+
+
+def _keenable_retry_delay(attempt: int, response: httpx.Response | None) -> float:
+    """Honor server minimum waits without synchronizing callers on that minimum."""
+    retry_after = 0.0
+    value = response.headers.get("retry-after", "").strip() if response else ""
+    if value and len(value) <= 128:
+        if re.fullmatch(r"[0-9]+", value):
+            retry_after = float(value)
+        else:
+            try:
+                date = parsedate_to_datetime(value)
+                if date.tzinfo is not None:
+                    retry_after = max(0.0, date.timestamp() - time.time())
+            except (ValueError, TypeError, OverflowError):
+                pass  # Malformed server hints fall back to local backoff.
+    base = _KEENABLE_BACKOFF_BASE * 2 ** (attempt - 1)
+    return max(base, retry_after) + random.uniform(0.0, base)
 
 
 def _search_health(
@@ -131,6 +185,9 @@ def _search_transport_event(
     phase: str = "request",
     response: httpx.Response | None = None,
     exception: BaseException | None = None,
+    elapsed_seconds: float | None = None,
+    retry_delay_seconds: float | None = None,
+    stop_reason: str | None = None,
 ) -> None:
     """Record bounded retry evidence separately from sample invalidation."""
     state = sample_state()
@@ -139,7 +196,8 @@ def _search_transport_event(
         "backend": "keenable",
         "retry_id": retry_id,
         "attempt": attempt,
-        "max_attempts": 2,
+        "max_attempts": _KEENABLE_MAX_ATTEMPTS,
+        "max_elapsed_seconds": _KEENABLE_MAX_ELAPSED,
         "phase": phase,
         "terminal": terminal,
         "sample_id": state.sample_id if state else None,
@@ -155,6 +213,20 @@ def _search_transport_event(
     if exception is not None:
         # Exception messages can contain headers or queries; retain only the type.
         event["exception_type"] = type(exception).__name__
+        causes: list[str] = []
+        seen = {id(exception)}
+        cause = exception.__cause__ or exception.__context__
+        while cause is not None and id(cause) not in seen and len(causes) < 4:
+            seen.add(id(cause))
+            causes.append(type(cause).__name__)
+            cause = cause.__cause__ or cause.__context__
+        event["exception_cause_types"] = causes
+    if elapsed_seconds is not None:
+        event["elapsed_seconds"] = round(elapsed_seconds, 6)
+    if retry_delay_seconds is not None:
+        event["retry_delay_seconds"] = round(retry_delay_seconds, 6)
+    if stop_reason is not None:
+        event["stop_reason"] = stop_reason
     if state is not None:
         state.metadata.setdefault("hle_tools_search_transport_attempts", []).append(
             event
@@ -282,66 +354,140 @@ async def _keenable_search(query: str, max_results: int) -> list[dict[str, str |
     if not key:
         raise RuntimeError("KEENABLE_API_KEY is unavailable; live search is blocked")
     retry_id = None
-    unrecovered_server_error = False
+    unrecovered_infrastructure_error = False
     last_server_error_diagnostics: dict[str, str | int] | None = None
+    recorded_error: httpx.HTTPError | None = None
     attempt_number = 0
+    search_started = attempt_started = time.monotonic()
+    deadline = search_started + _KEENABLE_MAX_ELAPSED
     phase = "client_open"
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            for attempt in range(2):
-                attempt_number = attempt + 1
-                phase = "request"
-                try:
-                    response = await client.post(
-                        "https://api.keenable.ai/v1/search",
-                        headers={"X-API-Key": key},
-                        json={
-                            "query": query,
-                            "max_results": max_results,
-                            "mode": "pro",
-                        },
-                    )
-                except httpx.HTTPError as error:
-                    if retry_id is not None:
-                        _search_transport_event(
-                            retry_id, attempt_number, terminal=True, exception=error
+        # HTTPX's 30s timeout is per I/O phase; this bounds the whole network
+        # operation, including admission, all attempts, waits and client cleanup.
+        async with asyncio.timeout(_KEENABLE_MAX_ELAPSED):
+            async with httpx.AsyncClient(timeout=30) as client:
+                for attempt_number in range(1, _KEENABLE_MAX_ATTEMPTS + 1):
+                    phase = "rate_limit"
+                    await _wait_for_keenable_request()
+                    attempt_started = time.monotonic()
+                    if attempt_started >= deadline:
+                        raise TimeoutError
+                    phase = "request"
+                    response = None
+                    request_error = None
+                    try:
+                        response = await client.post(
+                            "https://api.keenable.ai/v1/search",
+                            headers={"X-API-Key": key},
+                            json={
+                                "query": query,
+                                "max_results": max_results,
+                                "mode": "pro",
+                            },
                         )
-                    phase = "client_close"
-                    raise
-                if response.status_code in {500, 502, 504}:
-                    unrecovered_server_error = True
-                    diagnostics = _http_error_diagnostics("keenable", response)
-                    last_server_error_diagnostics = {
-                        key: diagnostics[key]
-                        for key in ("status", "body_sha256", "request_id")
-                        if key in diagnostics
-                    }
-                elif response.is_success:
-                    unrecovered_server_error = False
-                if retry_id is not None:
-                    _search_transport_event(
-                        retry_id, attempt_number, terminal=True, response=response
-                    )
-                if response.status_code not in {429, 500, 502, 504} or attempt == 1:
-                    break
-                retry_id = uuid4().hex
-                _search_transport_event(retry_id, 1, terminal=False, response=response)
-                phase = "backoff"
-                await asyncio.sleep(2)
-            phase = "client_close"
-            response.raise_for_status()
+                    except httpx.HTTPError as error:
+                        unrecovered_infrastructure_error = True
+                        recorded_error = request_error = error
+                        retryable = isinstance(
+                            error,
+                            (httpx.NetworkError, httpx.RemoteProtocolError),
+                        )
+                    else:
+                        retryable = response.status_code in {429, 500, 502, 504}
+                        if response.status_code in {500, 502, 504}:
+                            unrecovered_infrastructure_error = True
+                            diagnostics = _http_error_diagnostics("keenable", response)
+                            last_server_error_diagnostics = {
+                                key: diagnostics[key]
+                                for key in (
+                                    "status",
+                                    "body_sha256",
+                                    "request_id",
+                                )
+                                if key in diagnostics
+                            }
+                        elif response.is_success:
+                            unrecovered_infrastructure_error = False
+                    delay = None
+                    stop_reason = None
+                    if not retryable:
+                        stop_reason = (
+                            "success"
+                            if response is not None and response.is_success
+                            else "not_retryable"
+                        )
+                    elif attempt_number == _KEENABLE_MAX_ATTEMPTS:
+                        stop_reason = "attempt_limit"
+                    else:
+                        delay = _keenable_retry_delay(attempt_number, response)
+                        if delay >= deadline - time.monotonic():
+                            # Do not truncate Retry-After and retry prematurely.
+                            stop_reason = "elapsed_budget"
+                    terminal = stop_reason is not None
+                    if retryable or request_error is not None or retry_id is not None:
+                        retry_id = retry_id or uuid4().hex
+                        _search_transport_event(
+                            retry_id,
+                            attempt_number,
+                            terminal=terminal,
+                            response=response,
+                            exception=request_error,
+                            elapsed_seconds=time.monotonic() - attempt_started,
+                            retry_delay_seconds=delay,
+                            stop_reason=stop_reason,
+                        )
+                    if terminal:
+                        phase = "client_close"
+                        if request_error is not None:
+                            raise request_error
+                        assert response is not None
+                        response.raise_for_status()
+                        break
+                    assert delay is not None
+                    phase = "backoff"
+                    await asyncio.sleep(delay)
+                phase = "client_close"
+    except TimeoutError as error:
+        _search_transport_event(
+            retry_id or uuid4().hex,
+            attempt_number,
+            terminal=True,
+            phase=phase,
+            exception=error,
+            elapsed_seconds=time.monotonic() - search_started,
+            stop_reason="elapsed_budget",
+        )
+        # Keep the existing public timeout result and strict sample invalidation.
+        raise httpx.ReadTimeout("Keenable search elapsed budget exhausted") from error
+    except httpx.HTTPError as error:
+        if error is not recorded_error and not isinstance(error, httpx.HTTPStatusError):
+            _search_transport_event(
+                retry_id or uuid4().hex,
+                attempt_number,
+                terminal=True,
+                phase=phase,
+                exception=error,
+                elapsed_seconds=time.monotonic() - attempt_started,
+            )
+        raise
     except asyncio.CancelledError as error:
         if retry_id is not None:
             _search_transport_event(
-                retry_id, attempt_number, terminal=True, phase=phase, exception=error
+                retry_id,
+                attempt_number,
+                terminal=True,
+                phase=phase,
+                exception=error,
+                elapsed_seconds=time.monotonic() - attempt_started,
             )
-        if unrecovered_server_error:
+        if unrecovered_infrastructure_error:
             _search_health(
                 "keenable",
                 "search_retry_cancelled",
                 http_diagnostics=last_server_error_diagnostics,
             )
         raise
+    assert response is not None
     results = []
     for rank, item in enumerate(response.json().get("results", []), start=1):
         url = str(item.get("url", ""))

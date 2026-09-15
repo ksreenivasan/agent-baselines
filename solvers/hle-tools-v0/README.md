@@ -337,6 +337,55 @@ server denial body: platform authentication failures, unknown or malformed
 responses, additional JSON fields, and other backends remain guarded. Existing
 sample invalidations and fatal sentinels are not cleared by this classification.
 
+Keenable search makes at most three identical HTTP requests per logical search,
+retrying HTTP 429/500/502/504 or a network/remote protocol failure
+(`httpx.NetworkError` or `httpx.RemoteProtocolError`). Backoff uses a two-second
+base that doubles each retry, plus uniform jitter between zero and that base:
+2–4 seconds, then 4–8 seconds. A valid `Retry-After` (integer seconds or a
+timezone-aware HTTP date) replaces the base if longer, with jitter added after
+that minimum. Malformed hints fall back to local backoff; waits that cannot fit
+stop with the last failure instead of retrying before the server's minimum.
+
+A 60-second elapsed deadline covers client open/close, pacing, requests and
+backoff together; HTTPX's existing 30-second per-phase timeout also remains.
+This permits one extra recovery attempt while bounding network time near the
+old two-attempt nominal allowance. Ordinary backoff adds at most 12 seconds;
+a long server hint consumes the same 60-second budget. At most three POSTs can
+occur per logical search, and no attempt starts after that budget expires.
+The deadline cooperatively cancels asynchronous I/O; synchronous diagnostics,
+JSON parsing and URL/DNS filtering cannot be preempted by it. The outer sample
+deadline can cancel earlier. Production and the full allocation canary use an
+1800-second sample time limit; production model request timeouts are separately
+1650 seconds total and 1500 seconds per attempt. The offline tool smoke uses a
+120-second sample limit.
+
+Timeouts, local protocol, proxy, and decoding failures keep their existing
+no-retry policy. Transport
+failures are recorded from the first attempt in sample metadata and
+`tool-guard/transport-attempts.jsonl`, including exception/cause class names,
+elapsed seconds, phase, retry delay, stop reason and whether the attempt was
+terminal. Raw Retry-After headers, exception messages, queries, keys, and request
+headers are not recorded there. A recovered request
+does not newly invalidate a sample; exhaustion or cancellation after an
+unrecovered network/server failure does. Earlier sample invalidations are
+preserved. Historical `search_transport_error` events without this evidence
+cannot identify the underlying exception retroactively.
+
+Keenable documents a [10-request-per-second organization limit shared by its
+search and fetch APIs](https://docs.keenable.ai/rate-limits). This adapter paces
+actual Keenable API request starts, including retries, through one async gate
+per process. `HLE_KEENABLE_REQUESTS_PER_SECOND` defaults to `4` and must be a
+positive finite number; zero does not disable pacing. Divide the search budget
+across all simultaneous evaluator processes: two processes at 4 RPS or four at
+2 RPS budget eight requests per second together. Include recovery and smoke
+processes in that total. This is not an organization-wide coordinator: other
+processes and organization traffic can
+still consume the remaining quota or cause HTTP 429 responses. Direct website
+GETs from `fetch_url` do not use Keenable's API and are not paced by this gate.
+Model concurrency is unchanged. Retries consume gate slots just like first
+attempts, so the extra attempt cannot increase the configured per-process RPS.
+Waiting is cancellable and remains subject to the existing sample deadlines.
+
 
 ## Residual selection
 

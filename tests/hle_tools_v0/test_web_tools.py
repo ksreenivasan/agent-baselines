@@ -108,6 +108,10 @@ def test_fetch_requires_prior_search(monkeypatch):
 def clean_search_health(monkeypatch):
     module._search_failures.clear()
     monkeypatch.delenv("HLE_TOOL_GUARD_DIR", raising=False)
+    monkeypatch.delenv("HLE_KEENABLE_REQUESTS_PER_SECOND", raising=False)
+    monkeypatch.setattr(module, "_keenable_gate_loop", None)
+    monkeypatch.setattr(module, "_keenable_gate_lock", None)
+    monkeypatch.setattr(module, "_keenable_next_start", 0.0)
 
 
 def test_backend_must_be_explicit(monkeypatch, tmp_path):
@@ -181,6 +185,14 @@ def test_empty_search_resets_outage_counter(monkeypatch, tmp_path):
 
 
 def test_isolated_fetch_404_does_not_trip_search_guard(monkeypatch, tmp_path):
+    async def unexpected_keenable_request():
+        raise AssertionError("Direct website fetch must not consume Keenable quota")
+
+    monkeypatch.setenv("HLE_SEARCH_BACKEND", "keenable")
+    monkeypatch.setattr(
+        module, "_wait_for_keenable_request", unexpected_keenable_request
+    )
+
     class Stream:
         async def __aenter__(self):
             return httpx.Response(404)
@@ -580,8 +592,10 @@ def test_historical_403_search_error_is_not_reinterpreted(payload):
 
 @pytest.fixture
 def fake_keenable_http(monkeypatch, tmp_path):
-    def configure(outcomes, *, patch_state=True, close_cancel=False):
-        requests, delays = [], []
+    def configure(
+        outcomes, *, patch_state=True, close_cancel=False, pace_requests=False
+    ):
+        requests, request_times, delays = [], [], []
         pending = list(outcomes)
         state = SimpleNamespace(sample_id="sample-retry", epoch=1, metadata={})
         original_sleep = asyncio.sleep
@@ -600,10 +614,15 @@ def fake_keenable_http(monkeypatch, tmp_path):
 
             async def post(self, url, **kwargs):
                 requests.append({"url": url, **kwargs})
+                request_times.append(module.time.monotonic())
                 assert pending, "more than the planned HTTP attempts"
                 outcome = pending.pop(0)
                 if isinstance(outcome, BaseException):
                     raise outcome
+                if isinstance(outcome, httpx.Response):
+                    return outcome
+                if callable(outcome):
+                    return await outcome()
                 if outcome == "wait":
                     await asyncio.Event().wait()
                 response = httpx.Response(
@@ -619,22 +638,187 @@ def fake_keenable_http(monkeypatch, tmp_path):
                 return response
 
         async def sleep(delay):
-            assert delay == 2
             delays.append(delay)
             await original_sleep(0)
+
+        async def no_rate_wait():
+            pass
 
         monkeypatch.setenv("HLE_SEARCH_BACKEND", "keenable")
         monkeypatch.setenv("KEENABLE_API_KEY", "synthetic-key")
         monkeypatch.setenv("HLE_TOOL_GUARD_DIR", str(tmp_path / "guard"))
         monkeypatch.setattr(module.httpx, "AsyncClient", Client)
+        monkeypatch.setattr(module.random, "uniform", lambda low, high: low)
         monkeypatch.setattr(module.asyncio, "sleep", sleep)
+        if not pace_requests:
+            monkeypatch.setattr(module, "_wait_for_keenable_request", no_rate_wait)
         if patch_state:
             monkeypatch.setattr(module, "sample_state", lambda: state)
         return SimpleNamespace(
-            state=state, requests=requests, delays=delays, guard=tmp_path / "guard"
+            state=state,
+            requests=requests,
+            request_times=request_times,
+            delays=delays,
+            guard=tmp_path / "guard",
         )
 
     return configure
+
+
+@pytest.fixture
+def keenable_clock(monkeypatch):
+    original_sleep = asyncio.sleep
+    clock = SimpleNamespace(now=0.0, delays=[])
+
+    async def sleep(delay):
+        clock.delays.append(delay)
+        clock.now += delay
+        await original_sleep(0)
+
+    def install():
+        monkeypatch.setattr(module.time, "monotonic", lambda: clock.now)
+        monkeypatch.setattr(module.asyncio, "sleep", sleep)
+
+    clock.sleep = sleep
+    clock.install = install
+    return clock
+
+
+@pytest.mark.parametrize("rate,interval", [(None, 0.25), ("2", 0.5)])
+def test_keenable_gate_spaces_concurrent_search_starts(
+    monkeypatch, fake_keenable_http, keenable_clock, rate, interval
+):
+    fixture = fake_keenable_http([200] * 24, pace_requests=True)
+    keenable_clock.install()
+    if rate is not None:
+        monkeypatch.setenv("HLE_KEENABLE_REQUESTS_PER_SECOND", rate)
+
+    async def searches():
+        await asyncio.gather(
+            *(module._keenable_search("safe query", 3) for _ in range(24))
+        )
+
+    asyncio.run(searches())
+    assert fixture.request_times == pytest.approx([i * interval for i in range(24)])
+    assert len(fixture.requests) == 24
+
+
+def test_keenable_retry_shares_gate_with_other_searches(
+    fake_keenable_http, keenable_clock
+):
+    fixture = fake_keenable_http([500, 200, 200], pace_requests=True)
+    keenable_clock.install()
+
+    async def searches():
+        await asyncio.gather(
+            module._keenable_search("retry query", 3),
+            module._keenable_search("other query", 3),
+        )
+
+    asyncio.run(searches())
+    assert fixture.request_times == pytest.approx([0, 2, 2.25])
+    assert fixture.requests[0] == fixture.requests[2]
+    assert keenable_clock.delays == [2, 0.25]
+
+
+def test_keenable_gate_does_not_accumulate_burst_credit(keenable_clock):
+    keenable_clock.install()
+
+    async def requests():
+        await module._wait_for_keenable_request()
+        keenable_clock.now = 10
+        starts = []
+        for _ in range(3):
+            await module._wait_for_keenable_request()
+            starts.append(keenable_clock.now)
+        return starts
+
+    assert asyncio.run(requests()) == [10, 10.25, 10.5]
+
+
+def test_keenable_gate_resets_for_a_new_event_loop(keenable_clock):
+    keenable_clock.install()
+    asyncio.run(module._wait_for_keenable_request())
+    old_loop, old_lock = module._keenable_gate_loop, module._keenable_gate_lock
+    asyncio.run(module._wait_for_keenable_request())
+    assert module._keenable_gate_loop is not old_loop
+    assert module._keenable_gate_lock is not old_lock
+    assert keenable_clock.delays == []
+
+
+def test_cancelling_gate_waiter_releases_lock_without_reserving_slot(
+    monkeypatch, keenable_clock
+):
+    keenable_clock.install()
+
+    async def requests():
+        sleeping = asyncio.Event()
+        first_sleep = True
+
+        async def sleep(delay):
+            nonlocal first_sleep
+            if first_sleep:
+                first_sleep = False
+                sleeping.set()
+                await asyncio.Event().wait()
+            await keenable_clock.sleep(delay)
+
+        monkeypatch.setattr(module.asyncio, "sleep", sleep)
+        await module._wait_for_keenable_request()
+        cancelled = asyncio.create_task(module._wait_for_keenable_request())
+        await sleeping.wait()
+        following = asyncio.create_task(module._wait_for_keenable_request())
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        await following
+
+    asyncio.run(requests())
+    assert keenable_clock.now == 0.25
+    assert module._keenable_next_start == 0.5
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf", "", "private-key"])
+def test_invalid_keenable_rate_fails_before_request_without_value_leak(
+    monkeypatch, fake_keenable_http, value
+):
+    fixture = fake_keenable_http([], pace_requests=True)
+    monkeypatch.setenv("HLE_KEENABLE_REQUESTS_PER_SECOND", value)
+    with pytest.raises(RuntimeError) as caught:
+        asyncio.run(web_search()(query="safe query"))
+    assert (
+        str(caught.value)
+        == "HLE_KEENABLE_REQUESTS_PER_SECOND must be a positive finite number"
+    )
+    assert fixture.requests == []
+    assert (
+        fixture.state.metadata["hle_tools_infrastructure_errors"][0]["error"]
+        == "search_configuration_error"
+    )
+
+
+@pytest.mark.parametrize("initial", [500, httpx.ReadError("interrupted")])
+def test_cancellation_in_retry_rate_gate_preserves_invalidation(
+    monkeypatch, fake_keenable_http, initial
+):
+    fixture = fake_keenable_http([initial])
+    calls = 0
+
+    async def gate():
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(module, "_wait_for_keenable_request", gate)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(web_search()(query="safe query"))
+    assert len(fixture.requests) == 1
+    assert fixture.state.metadata["hle_tools_invalidated"] is True
+    event = fixture.state.metadata["hle_tools_search_transport_attempts"][-1]
+    assert (
+        event["phase"] == "rate_limit" and event["exception_type"] == "CancelledError"
+    )
 
 
 @pytest.mark.parametrize("initial", [500, 502, 504, 429])
@@ -675,18 +859,18 @@ def test_transient_retry_success_uses_identical_request_without_invalidation(
     "initial,final",
     [(a, b) for a in (500, 502, 504, 429) for b in (500, 502, 504, 429)],
 )
-def test_retry_exhaustion_invalidates_once_and_never_makes_a_third_request(
+def test_retry_exhaustion_invalidates_once_and_never_makes_a_fourth_request(
     fake_keenable_http, initial, final
 ):
-    fixture = fake_keenable_http([initial, final])
+    fixture = fake_keenable_http([initial, final, final])
     result = asyncio.run(web_search()(query="safe query"))
     assert result == {"backend": "keenable", "error": f"search_http_{final}"}
-    assert len(fixture.requests) == 2 and fixture.delays == [2]
+    assert len(fixture.requests) == 3 and fixture.delays == [2, 4]
     assert fixture.state.metadata["hle_tools_invalidated"] is True
     assert len(fixture.state.metadata["hle_tools_infrastructure_errors"]) == 1
     assert module._search_failures["keenable"] == 1
     assert not (fixture.guard / "fatal.json").exists()
-    assert len(fixture.state.metadata["hle_tools_search_transport_attempts"]) == 2
+    assert len(fixture.state.metadata["hle_tools_search_transport_attempts"]) == 3
 
 
 @pytest.mark.parametrize("status", [401, 402, 403, 404, 422, 503])
@@ -711,15 +895,135 @@ def test_no_new_retry_for_auth_content_or_other_5xx(fake_keenable_http, status):
 def test_retry_final_transport_exception_keeps_evidence_and_existing_error(
     fake_keenable_http, error, expected, initial
 ):
-    fixture = fake_keenable_http([initial, error])
+    fixture = fake_keenable_http([initial, initial, error])
     assert asyncio.run(web_search()(query="safe query"))["error"] == expected
-    assert len(fixture.requests) == 2
+    assert len(fixture.requests) == 3
     events = fixture.state.metadata["hle_tools_search_transport_attempts"]
     assert events[-1]["exception_type"] == type(error).__name__
     assert events[-1]["terminal"] is True
     assert fixture.state.metadata["hle_tools_invalidated"] is True
     sidecar = (fixture.guard / "transport-attempts.jsonl").read_text()
     assert "private-query" not in sidecar and "synthetic-key" not in sidecar
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [
+        httpx.ConnectError,
+        httpx.ReadError,
+        httpx.WriteError,
+        httpx.CloseError,
+        httpx.RemoteProtocolError,
+    ],
+)
+@pytest.mark.parametrize("prior_invalidation", [False, True])
+def test_first_network_failure_retries_identically_with_safe_evidence(
+    fake_keenable_http, error_type, prior_invalidation
+):
+    error = error_type("private-query synthetic-key")
+    error.__cause__ = OSError("private-query synthetic-key")
+    fixture = fake_keenable_http([error, 200])
+    if prior_invalidation:
+        fixture.state.metadata["hle_tools_invalidated"] = True
+    assert asyncio.run(web_search()(query="private-query", max_results=7)) == []
+    assert len(fixture.requests) == 2
+    assert fixture.requests[0] == fixture.requests[1]
+    assert fixture.delays == [2]
+    assert (
+        bool(fixture.state.metadata.get("hle_tools_invalidated")) is prior_invalidation
+    )
+    assert "hle_tools_infrastructure_errors" not in fixture.state.metadata
+    assert not (fixture.guard / "events.jsonl").exists()
+    events = fixture.state.metadata["hle_tools_search_transport_attempts"]
+    assert [e["attempt"] for e in events] == [1, 2]
+    assert [e["terminal"] for e in events] == [False, True]
+    assert events[0]["exception_type"] == error_type.__name__
+    assert events[0]["exception_cause_types"] == ["OSError"]
+    assert all(e["elapsed_seconds"] >= 0 for e in events)
+    assert events[1]["http_diagnostics"]["status"] == 200
+    assert events[0]["retry_id"] == events[1]["retry_id"]
+    sidecar = (fixture.guard / "transport-attempts.jsonl").read_text()
+    assert [json.loads(line) for line in sidecar.splitlines()] == events
+    assert "private-query" not in sidecar and "synthetic-key" not in sidecar
+
+
+@pytest.mark.parametrize(
+    "final,expected",
+    [
+        (httpx.ReadError("interrupted"), "search_transport_error"),
+        (httpx.RemoteProtocolError("disconnected"), "search_transport_error"),
+        (httpx.ReadTimeout("timed out"), "search_timeout"),
+        (500, "search_http_500"),
+        (429, "search_http_429"),
+    ],
+)
+def test_network_retry_exhaustion_invalidates_once_without_fourth_request(
+    fake_keenable_http, final, expected
+):
+    fixture = fake_keenable_http(
+        [httpx.ReadError("interrupted"), httpx.ReadError("interrupted"), final]
+    )
+    assert asyncio.run(web_search()(query="safe query"))["error"] == expected
+    assert len(fixture.requests) == 3 and fixture.delays == [2, 4]
+    assert fixture.state.metadata["hle_tools_invalidated"] is True
+    assert len(fixture.state.metadata["hle_tools_infrastructure_errors"]) == 1
+    assert module._search_failures["keenable"] == 1
+    events = fixture.state.metadata["hle_tools_search_transport_attempts"]
+    assert len(events) == 3 and events[-1]["terminal"] is True
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [
+        httpx.ReadTimeout,
+        httpx.LocalProtocolError,
+        httpx.UnsupportedProtocol,
+        httpx.ProxyError,
+        httpx.DecodingError,
+    ],
+)
+def test_other_first_transport_failures_are_logged_without_retry(
+    fake_keenable_http, error_type
+):
+    fixture = fake_keenable_http([error_type("private-query synthetic-key")])
+    result = asyncio.run(web_search()(query="safe query"))
+    expected = (
+        "search_timeout"
+        if error_type is httpx.ReadTimeout
+        else "search_transport_error"
+    )
+    assert result["error"] == expected
+    assert len(fixture.requests) == 1 and not fixture.delays
+    assert fixture.state.metadata["hle_tools_invalidated"] is True
+    events = fixture.state.metadata["hle_tools_search_transport_attempts"]
+    assert len(events) == 1 and events[0]["terminal"] is True
+    assert events[0]["exception_type"] == error_type.__name__
+    sidecar = (fixture.guard / "transport-attempts.jsonl").read_text()
+    assert "private-query" not in sidecar and "synthetic-key" not in sidecar
+
+
+@pytest.mark.parametrize("phase", ["backoff", "request"])
+def test_network_retry_cancellation_preserves_invalidation(
+    monkeypatch, fake_keenable_http, phase
+):
+    fixture = fake_keenable_http(
+        [httpx.ReadError("interrupted"), asyncio.CancelledError()]
+    )
+    if phase == "backoff":
+
+        async def cancel(delay):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(module.asyncio, "sleep", cancel)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(web_search()(query="safe query"))
+    assert len(fixture.requests) == (1 if phase == "backoff" else 2)
+    events = fixture.state.metadata["hle_tools_search_transport_attempts"]
+    assert events[-1]["exception_type"] == "CancelledError"
+    assert events[-1]["phase"] == phase and events[-1]["terminal"] is True
+    assert fixture.state.metadata["hle_tools_invalidated"] is True
+    errors = fixture.state.metadata["hle_tools_infrastructure_errors"]
+    assert len(errors) == 1 and errors[0]["error"] == "search_retry_cancelled"
 
 
 @pytest.mark.parametrize("initial", [500, 502, 504, 429])
@@ -764,9 +1068,7 @@ def test_first_request_cancellation_is_unchanged(fake_keenable_http):
 
 
 @pytest.mark.parametrize("initial", [500, 502, 504])
-def test_existing_deadline_cancels_retry_without_a_new_timeout_policy(
-    fake_keenable_http, initial
-):
+def test_shorter_sample_deadline_cancels_retry(fake_keenable_http, initial):
     fixture = fake_keenable_http([initial, "wait"])
 
     async def deadline():
@@ -798,7 +1100,7 @@ def test_recovered_server_error_preserves_prior_invalidation(
     assert fixture.state.metadata["hle_tools_infrastructure_errors"] == [prior]
 
 
-@pytest.mark.parametrize("initial", [500, 502, 504])
+@pytest.mark.parametrize("initial", [500, 502, 504, httpx.ReadError("interrupted")])
 @pytest.mark.parametrize(
     "final,expected",
     [(200, "retain_score"), (500, "generate"), (502, "generate"), (504, "generate")],
@@ -813,9 +1115,13 @@ def test_native_retry_evidence_and_acceptance_round_trip(
     from inspect_ai.solver import solver
     from inspect_ai.tool import ToolCall
 
-    # Keep Inspect's own asyncio scheduling intact; two real seconds is bounded.
+    # Keep Inspect's scheduling intact and use tiny real backoff intervals.
     original_sleep = asyncio.sleep
-    fixture = fake_keenable_http([initial, final], patch_state=False)
+    fixture = fake_keenable_http(
+        [initial, final] if final == 200 else [initial, final, final],
+        patch_state=False,
+    )
+    monkeypatch.setattr(module, "_KEENABLE_BACKOFF_BASE", 0.001)
     monkeypatch.setattr(module.asyncio, "sleep", original_sleep)
 
     @solver
@@ -862,7 +1168,11 @@ def test_native_retry_evidence_and_acceptance_round_trip(
     assert disposition(row)[0] == expected
     assert row["scores"]["hle_scorer"]["value"] == "I"
     events = row["metadata"]["hle_tools_search_transport_attempts"]
-    assert [e["http_diagnostics"]["status"] for e in events] == [initial, final]
+    if isinstance(initial, httpx.ReadError):
+        assert events[0]["exception_type"] == "ReadError"
+    else:
+        assert events[0]["http_diagnostics"]["status"] == initial
+    assert events[1]["http_diagnostics"]["status"] == final
     assert all(e["sample_id"] == "native-retry" for e in events)
     assert events == [
         json.loads(line)
@@ -888,6 +1198,8 @@ def test_native_retry_evidence_and_acceptance_round_trip(
         ([500, 200], False),
         ([504, 200], False),
         ([502, 200], False),
+        ([httpx.ReadError("interrupted"), httpx.ReadError("interrupted")], True),
+        ([httpx.ReadError("interrupted"), 200], False),
         ([429, 429], False),
         ([200], False),
     ],
@@ -895,19 +1207,27 @@ def test_native_retry_evidence_and_acceptance_round_trip(
 def test_client_close_cancellation_after_unrecovered_server_error_is_not_lost(
     fake_keenable_http, outcomes, invalidated
 ):
+    if len(outcomes) == 2 and outcomes[-1] != 200:
+        outcomes = [*outcomes, outcomes[-1]]
     fixture = fake_keenable_http(outcomes, close_cancel=True)
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(web_search()(query="safe query"))
     assert len(fixture.requests) == len(outcomes)
     assert bool(fixture.state.metadata.get("hle_tools_invalidated")) is invalidated
-    if len(outcomes) == 2:
+    if len(outcomes) >= 2:
         events = fixture.state.metadata["hle_tools_search_transport_attempts"]
         assert events[-1]["phase"] == "client_close"
         assert events[-1]["exception_type"] == "CancelledError"
         if invalidated:
             invalidation = fixture.state.metadata["hle_tools_infrastructure_errors"][0]
-            assert invalidation["http_diagnostics"] == events[-2]["http_diagnostics"]
-            assert invalidation["http_diagnostics"]["status"] == outcomes[-1]
+            if isinstance(outcomes[-1], int):
+                assert (
+                    invalidation["http_diagnostics"] == events[-2]["http_diagnostics"]
+                )
+                assert invalidation["http_diagnostics"]["status"] == outcomes[-1]
+            else:
+                assert events[-2]["exception_type"] == "ReadError"
+                assert "http_diagnostics" not in invalidation
             assert (
                 json.loads((fixture.guard / "events.jsonl").read_text()) == invalidation
             )
@@ -937,3 +1257,192 @@ def test_historical_target_timeout_stays_an_infrastructure_failure():
         ],
     }
     assert disposition(row) == ("generate", "web_backend_error")
+
+
+@pytest.mark.parametrize("fraction", [0.0, 0.5, 1.0])
+def test_exponential_jitter_reaches_third_attempt(
+    monkeypatch, fake_keenable_http, fraction
+):
+    fixture = fake_keenable_http([httpx.ReadError("private-query"), 429, 200])
+    monkeypatch.setattr(module.random, "uniform", lambda low, high: fraction * high)
+    assert asyncio.run(web_search()(query="safe query")) == []
+    assert fixture.delays == [2 * (1 + fraction), 4 * (1 + fraction)]
+    assert fixture.requests == [fixture.requests[0]] * 3
+    events = fixture.state.metadata["hle_tools_search_transport_attempts"]
+    assert [event["attempt"] for event in events] == [1, 2, 3]
+    assert [event["terminal"] for event in events] == [False, False, True]
+    assert len({event["retry_id"] for event in events}) == 1
+    assert all(event["max_attempts"] == 3 for event in events)
+    assert "hle_tools_invalidated" not in fixture.state.metadata
+
+
+@pytest.mark.parametrize(
+    "header,expected",
+    [
+        ("10", 11),
+        (" 10 ", 11),
+        ("0", 3),
+        ("Tue, 14 Nov 2023 22:13:30 GMT", 11),
+        ("Tue, 14 Nov 2023 22:13:10 GMT", 3),
+        ("Tue, 14 Nov 2023 22:13:30", 3),
+        ("-1", 3),
+        ("NaN", 3),
+        ("Infinity", 3),
+        ("1.5", 3),
+        ("private-query synthetic-key", 3),
+        ("x" * 129, 3),
+    ],
+)
+def test_retry_after_minimum_plus_jitter_or_safe_fallback(
+    monkeypatch, header, expected
+):
+    monkeypatch.setattr(module.time, "time", lambda: 1700000000.0)
+    monkeypatch.setattr(module.random, "uniform", lambda low, high: high / 2)
+    response = httpx.Response(429, headers={"Retry-After": header})
+    assert module._keenable_retry_delay(1, response) == expected
+
+
+@pytest.mark.parametrize("status", [429, 500, 502, 504])
+def test_retry_after_waits_before_paced_post(
+    fake_keenable_http, keenable_clock, status
+):
+    response = httpx.Response(
+        status,
+        headers={"Retry-After": "10"},
+        request=httpx.Request("POST", "https://api.keenable.ai/v1/search"),
+    )
+    fixture = fake_keenable_http([response, 200], pace_requests=True)
+    keenable_clock.install()
+    assert asyncio.run(web_search()(query="safe query")) == []
+    assert fixture.request_times == [0, 10]
+    events = fixture.state.metadata["hle_tools_search_transport_attempts"]
+    assert events[0]["retry_delay_seconds"] == 10
+    assert (
+        "retry-after"
+        not in (fixture.guard / "transport-attempts.jsonl").read_text().lower()
+    )
+
+
+@pytest.mark.parametrize("header", ["60", "3600", "9" * 128])
+def test_retry_after_outside_budget_preserves_status_without_early_retry(
+    fake_keenable_http, keenable_clock, header
+):
+    response = httpx.Response(
+        429,
+        headers={"Retry-After": header},
+        request=httpx.Request("POST", "https://api.keenable.ai/v1/search"),
+    )
+    fixture = fake_keenable_http([response])
+    keenable_clock.install()
+    assert asyncio.run(web_search()(query="safe query"))["error"] == "search_http_429"
+    assert len(fixture.requests) == 1 and keenable_clock.delays == []
+    events = fixture.state.metadata["hle_tools_search_transport_attempts"]
+    assert len(events) == 1 and events[0]["terminal"] is True
+    assert events[0]["stop_reason"] == "elapsed_budget"
+    assert fixture.state.metadata["hle_tools_invalidated"] is True
+
+
+def test_slow_failure_exhausts_elapsed_budget_before_attempt_limit(
+    fake_keenable_http, keenable_clock
+):
+    async def slow_failure():
+        keenable_clock.now += 59
+        raise httpx.ReadError("private-query synthetic-key")
+
+    fixture = fake_keenable_http([slow_failure])
+    keenable_clock.install()
+    assert (
+        asyncio.run(web_search()(query="safe query"))["error"]
+        == "search_transport_error"
+    )
+    assert len(fixture.requests) == 1 and keenable_clock.delays == []
+    events = fixture.state.metadata["hle_tools_search_transport_attempts"]
+    assert events[-1]["stop_reason"] == "elapsed_budget"
+    assert events[-1]["exception_type"] == "ReadError"
+    assert fixture.state.metadata["hle_tools_invalidated"] is True
+
+
+def test_no_post_after_pacing_consumes_remaining_budget(
+    monkeypatch, fake_keenable_http, keenable_clock
+):
+    fixture = fake_keenable_http([500])
+    keenable_clock.install()
+    gates = 0
+
+    async def gate():
+        nonlocal gates
+        gates += 1
+        if gates == 2:
+            keenable_clock.now = 60
+
+    monkeypatch.setattr(module, "_wait_for_keenable_request", gate)
+    assert asyncio.run(web_search()(query="safe query"))["error"] == "search_timeout"
+    assert len(fixture.requests) == 1
+    event = fixture.state.metadata["hle_tools_search_transport_attempts"][-1]
+    assert event["phase"] == "rate_limit" and event["stop_reason"] == "elapsed_budget"
+    assert fixture.state.metadata["hle_tools_invalidated"] is True
+
+
+@pytest.mark.parametrize("phase", ["rate_limit", "request", "backoff", "client_close"])
+def test_elapsed_deadline_interrupts_blocked_network_operation(
+    monkeypatch, fake_keenable_http, phase
+):
+    fixture = fake_keenable_http([500] if phase == "backoff" else ["wait"])
+    original_timeout = asyncio.timeout
+    original_client = module.httpx.AsyncClient
+    blocked = asyncio.Event()
+
+    # Expire the real timeout only after entering the chosen blocking phase.
+    # No race with machine speed, real network, or a wall-clock assertion.
+    async def wait_forever(*args, **kwargs):
+        deadline.reschedule(asyncio.get_running_loop().time())
+        blocked.set()
+        await asyncio.Event().wait()
+
+    def timeout(seconds):
+        nonlocal deadline
+        assert seconds == 60
+        deadline = original_timeout(None)
+        return deadline
+
+    deadline = None
+    monkeypatch.setattr(module.asyncio, "timeout", timeout)
+    if phase == "rate_limit":
+        monkeypatch.setattr(module, "_wait_for_keenable_request", wait_forever)
+    elif phase == "backoff":
+        monkeypatch.setattr(module.asyncio, "sleep", wait_forever)
+    elif phase == "request":
+        monkeypatch.setattr(original_client, "post", wait_forever)
+    else:
+        fixture = fake_keenable_http([200])
+        monkeypatch.setattr(module.httpx.AsyncClient, "__aexit__", wait_forever)
+    assert asyncio.run(web_search()(query="safe query"))["error"] == "search_timeout"
+    assert blocked.is_set()
+    assert len(fixture.requests) <= 1
+    event = fixture.state.metadata["hle_tools_search_transport_attempts"][-1]
+    assert event["phase"] == phase and event["stop_reason"] == "elapsed_budget"
+    errors = fixture.state.metadata["hle_tools_infrastructure_errors"]
+    assert len(errors) == 1 and errors[0]["error"] == "search_timeout"
+
+
+def test_all_three_attempts_share_process_pacing_under_concurrent_failures(
+    fake_keenable_http, keenable_clock
+):
+    fixture = fake_keenable_http([500] * 12, pace_requests=True)
+    keenable_clock.install()
+
+    async def searches():
+        return await asyncio.gather(
+            *(module._keenable_search("safe query", 3) for _ in range(4)),
+            return_exceptions=True,
+        )
+
+    results = asyncio.run(searches())
+    assert all(isinstance(result, httpx.HTTPStatusError) for result in results)
+    assert len(fixture.requests) == 12
+    assert all(
+        later - earlier >= 0.25
+        for earlier, later in zip(fixture.request_times, fixture.request_times[1:])
+    )
+    events = fixture.state.metadata["hle_tools_search_transport_attempts"]
+    assert sum(event.get("stop_reason") == "attempt_limit" for event in events) == 4
