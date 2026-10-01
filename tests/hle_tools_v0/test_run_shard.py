@@ -50,6 +50,8 @@ def test_client_timeout_reaches_vllm_client_and_is_optional(tmp_path):
     cfg = config() | {"client_timeout": 3400}
     command = runner.make_command(cfg, tmp_path / "ids.json", tmp_path, tmp_path)
     assert command[command.index("-M") + 1] == "client_timeout=3400"
+    openai = runner.make_command(cfg | {"model": "openai/gpt-test"}, tmp_path / "ids.json", tmp_path, tmp_path)
+    assert openai[openai.index("-M") + 1] == "client_timeout=3400"
     with pytest.raises(ValueError, match="client_timeout"):
         runner.make_command(cfg | {"model": "google/gemini-test"}, tmp_path / "ids.json", tmp_path, tmp_path)
 

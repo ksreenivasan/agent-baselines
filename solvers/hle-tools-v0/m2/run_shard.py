@@ -325,9 +325,10 @@ def make_command(config: dict, manifest: Path, local: Path, repo: Path) -> list[
         str(local),
     ]
     if config.get("client_timeout") is not None:
-        # Per-HTTP-request read timeout for the vLLM client (openai SDK default is 600 s).
-        if not config["model"].startswith(("vllm/", "k2-vllm/")):
-            raise ValueError("client_timeout is only wired for the vLLM providers")
+        # Per-HTTP-request read timeout of the openai-SDK clients (vllm, k2-vllm, openai;
+        # the SDK default is 600 s). The google provider takes its timeout from config.timeout.
+        if config["model"].startswith("google/"):
+            raise ValueError("client_timeout is not supported for the google provider")
         command += ["-M", f"client_timeout={config['client_timeout']}"]
     if task != "hle_tools_canary":
         command += [
