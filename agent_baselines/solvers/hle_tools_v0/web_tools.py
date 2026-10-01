@@ -296,7 +296,9 @@ def _public_http_url(url: str) -> bool:
         return False
     try:
         addresses = socket.getaddrinfo(parsed.hostname, parsed.port or 443)
-    except socket.gaierror:
+    except OSError:
+        # gaierror is a subclass; the resolver can also raise a bare OSError (e.g. errno 0)
+        # for some hostnames. Treat any resolution failure as unresolvable, not a sample error.
         return False
     for address in addresses:
         ip = ipaddress.ip_address(address[4][0])

@@ -1446,3 +1446,22 @@ def test_all_three_attempts_share_process_pacing_under_concurrent_failures(
     )
     events = fixture.state.metadata["hle_tools_search_transport_attempts"]
     assert sum(event.get("stop_reason") == "attempt_limit" for event in events) == 4
+
+
+def test_public_http_url_treats_any_resolver_oserror_as_unresolvable(monkeypatch):
+    # Seen in production: getaddrinfo raised a bare OSError(0, 'Error') for a search-result host,
+    # which escaped the gaierror handler and failed the whole sample.
+    def bare_oserror(*args, **kwargs):
+        raise OSError(0, "Error")
+
+    monkeypatch.setattr(module.socket, "getaddrinfo", bare_oserror)
+    assert module._public_http_url("https://odd-host.example/paper.pdf") is False
+
+    def gaierror(*args, **kwargs):
+        raise module.socket.gaierror(-2, "Name or service not known")
+
+    monkeypatch.setattr(module.socket, "getaddrinfo", gaierror)
+    assert module._public_http_url("https://missing.example/") is False
+
+    monkeypatch.setattr(module.socket, "getaddrinfo", lambda *a, **k: [(2, 1, 6, "", ("93.184.216.34", 443))])
+    assert module._public_http_url("https://example.com/") is True
