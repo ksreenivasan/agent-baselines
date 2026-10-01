@@ -45,3 +45,8 @@ def test_direct_condition_is_one_tool_free_multimodal_generation():
     assert calls == 1
     assert logs[0].status == "success"
     assert str(logs[0].samples[0].scores["hle_scorer"].value) == "C"
+
+
+def test_direct_time_limit_defaults_to_1800_and_is_a_task_parameter():
+    assert hle_direct(fixture=True).time_limit == 1800
+    assert hle_direct(fixture=True, time_limit=3600).time_limit == 3600
