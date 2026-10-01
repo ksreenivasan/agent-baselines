@@ -324,6 +324,11 @@ def make_command(config: dict, manifest: Path, local: Path, repo: Path) -> list[
         "--log-dir",
         str(local),
     ]
+    if config.get("client_timeout") is not None:
+        # Per-HTTP-request read timeout for the vLLM client (openai SDK default is 600 s).
+        if not config["model"].startswith(("vllm/", "k2-vllm/")):
+            raise ValueError("client_timeout is only wired for the vLLM providers")
+        command += ["-M", f"client_timeout={config['client_timeout']}"]
     if task != "hle_tools_canary":
         command += [
             "-T",

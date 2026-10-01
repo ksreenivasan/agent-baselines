@@ -44,6 +44,16 @@ def test_command_preserves_uncapped_baseline_and_exact_manifest(tmp_path):
     assert "--skip-smoke-test" not in command
 
 
+def test_client_timeout_reaches_vllm_client_and_is_optional(tmp_path):
+    baseline = runner.make_command(config(), tmp_path / "ids.json", tmp_path, tmp_path)
+    assert "-M" not in baseline
+    cfg = config() | {"client_timeout": 3400}
+    command = runner.make_command(cfg, tmp_path / "ids.json", tmp_path, tmp_path)
+    assert command[command.index("-M") + 1] == "client_timeout=3400"
+    with pytest.raises(ValueError, match="client_timeout"):
+        runner.make_command(cfg | {"model": "google/gemini-test"}, tmp_path / "ids.json", tmp_path, tmp_path)
+
+
 def test_provider_specific_arguments_do_not_leak_to_gemini(tmp_path):
     cfg = config()
     cfg.update(model="google/gemini-test", model_base_url=None, top_p=None)

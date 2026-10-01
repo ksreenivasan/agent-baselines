@@ -51,6 +51,6 @@ def hle_tools_v0(
             judge_reasoning_effort=judge_reasoning_effort,
         ),
         sandbox=_sandbox(sandbox_backend),
-        time_limit=1800,
+        time_limit=3600,
         message_limit=80,
     )
