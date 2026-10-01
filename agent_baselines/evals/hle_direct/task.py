@@ -16,6 +16,7 @@ def hle_direct(
     dataset_revision: str | None = None,
     judge_model: str | Model = DEFAULT_JUDGE_MODEL,
     judge_reasoning_effort: str = "medium",
+    time_limit: int = 1800,
 ) -> Task:
     """AA-compatible, tool-free HLE evaluation; standard text-only HLE by default."""
     return Task(
@@ -32,6 +33,6 @@ def hle_direct(
             judge_model=judge_model,
             judge_reasoning_effort=judge_reasoning_effort,
         ),
-        time_limit=1800,
+        time_limit=time_limit,
         message_limit=10,
     )

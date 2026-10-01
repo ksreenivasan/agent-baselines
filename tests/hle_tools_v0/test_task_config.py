@@ -8,7 +8,8 @@ def test_task_uses_turn_and_time_bounds_without_cumulative_token_limit(monkeypat
     task = hle_tools_v0(fixture=True)
     assert task.token_limit is None
     assert task.message_limit == 80
-    assert task.time_limit == 3600
+    assert task.time_limit == 1800
+    assert hle_tools_v0(fixture=True, time_limit=3600).time_limit == 3600
     assert task.dataset[0].metadata["dataset_variant"] == "standard"
 
 

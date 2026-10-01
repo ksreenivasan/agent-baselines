@@ -342,6 +342,8 @@ def make_command(config: dict, manifest: Path, local: Path, repo: Path) -> list[
             "-T",
             "judge_reasoning_effort=medium",
         ]
+        if config.get("time_limit") is not None:
+            command += ["-T", f"time_limit={config['time_limit']}"]
     if task == "hle_tools":
         command += ["-T", "sandbox_backend=m2-enroot"]
     if config.get("model_base_url"):
